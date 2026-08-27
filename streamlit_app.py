@@ -3738,17 +3738,21 @@ elif menu == "Excel Export":
     select_sql = detailed_columns if include_details else basic_columns
 
     conn = get_connection()
-    export_df = pd.read_sql_query(
+    export_rows = conn.execute(
         f"""
         {select_sql}
         FROM chemicals c
         LEFT JOIN storage_units su ON c.storage_unit_id = su.id
         {status_clause}
         ORDER BY c.chemical_name, c.id
-        """,
-        conn,
-    )
+        """
+    ).fetchall()
     conn.close()
+
+    # Build the DataFrame from psycopg rows directly.
+    # pandas.read_sql_query expects a DB-API connection exposing .cursor(),
+    # while this app intentionally uses CompatConnection.
+    export_df = pd.DataFrame([dict(row) for row in export_rows])
 
     summary_col1, summary_col2 = st.columns(2)
     summary_col1.metric("Chemicals to Export", f"{len(export_df):,}")
