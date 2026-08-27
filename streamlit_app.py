@@ -9,6 +9,7 @@ from io import BytesIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -1217,6 +1218,222 @@ def render_safety_panel(
 # DIALOGS
 # ============================================================
 
+@st.dialog("✏️ Edit Chemical", width="large")
+def edit_chemical_dialog(chemical_id):
+    conn = get_connection()
+    chemical = conn.execute(
+        "SELECT * FROM chemicals WHERE id=?",
+        (chemical_id,),
+    ).fetchone()
+    conn.close()
+
+    if not chemical:
+        st.error("Chemical not found.")
+        return
+
+    st.markdown(f"### {chemical['chemical_name']}")
+    st.caption(
+        f"Bottle ID: {chemical['bottle_id'] or '-'}   |   "
+        f"Legacy ID: {chemical['legacy_id'] or '-'}"
+    )
+
+    storage_options = get_storage_options()
+    storage_index = current_location_index(
+        storage_options,
+        chemical["storage_unit_id"],
+        chemical["shelf_number"],
+    )
+
+    unit_options = ["g", "mg", "kg", "mL", "L", "ea"]
+    current_unit = chemical["unit"] or "g"
+    if current_unit not in unit_options:
+        unit_options.append(current_unit)
+
+    status_options = ["Unopened", "In Use", "Disposal Pending"]
+    current_status = chemical["status"] or "Unopened"
+    if current_status not in status_options:
+        status_options.append(current_status)
+
+    with st.form(f"edit_chemical_form_{chemical_id}", enter_to_submit=False):
+        edit_name = st.text_input(
+            "Chemical Name *",
+            value=chemical["chemical_name"] or "",
+            key=f"edit_name_{chemical_id}",
+        )
+        edit_description = st.text_input(
+            "Description / Grade",
+            value=chemical["description"] or "",
+            key=f"edit_description_{chemical_id}",
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            edit_cas = st.text_input(
+                "CAS No.",
+                value=chemical["cas_number"] or "",
+                key=f"edit_cas_{chemical_id}",
+            )
+            edit_manufacturer = st.text_input(
+                "Manufacturer",
+                value=chemical["manufacturer"] or "",
+                key=f"edit_manufacturer_{chemical_id}",
+            )
+            edit_catalog = st.text_input(
+                "Catalog No.",
+                value=chemical["catalog_number"] or "",
+                key=f"edit_catalog_{chemical_id}",
+            )
+            edit_lot = st.text_input(
+                "Lot No.",
+                value=chemical["lot_number"] or "",
+                key=f"edit_lot_{chemical_id}",
+            )
+            edit_initial = st.number_input(
+                "Initial Amount",
+                min_value=0.0,
+                value=float(
+                    chemical["initial_amount"]
+                    if chemical["initial_amount"] is not None
+                    else chemical["amount"] or 0
+                ),
+                key=f"edit_initial_{chemical_id}",
+            )
+
+        with col2:
+            edit_remaining = st.number_input(
+                "Remaining Amount",
+                min_value=0.0,
+                value=float(
+                    chemical["remaining_amount"]
+                    if chemical["remaining_amount"] is not None
+                    else chemical["amount"] or 0
+                ),
+                key=f"edit_remaining_{chemical_id}",
+            )
+            edit_unit = st.selectbox(
+                "Unit",
+                unit_options,
+                index=unit_options.index(current_unit),
+                key=f"edit_unit_{chemical_id}",
+            )
+            edit_storage = st.selectbox(
+                "Storage Location",
+                storage_options,
+                index=storage_index,
+                format_func=lambda option: option[2],
+                key=f"edit_storage_{chemical_id}",
+            )
+            edit_owner = st.text_input(
+                "Owner / Person in Charge",
+                value=chemical["owner"] or "",
+                key=f"edit_owner_{chemical_id}",
+            )
+            edit_expiration = st.text_input(
+                "Expiration Date",
+                value=chemical["expiration_date"] or "",
+                placeholder="YYYY-MM-DD",
+                key=f"edit_expiration_{chemical_id}",
+            )
+
+        edit_status = st.selectbox(
+            "Status",
+            status_options,
+            index=status_options.index(current_status),
+            key=f"edit_status_{chemical_id}",
+        )
+
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            save_edit = st.form_submit_button(
+                "Save Changes",
+                type="primary",
+                width="stretch",
+            )
+        with cancel_col:
+            cancel_edit = st.form_submit_button(
+                "Cancel",
+                width="stretch",
+            )
+
+    if save_edit:
+        if not edit_name.strip():
+            st.error("Chemical name is required.")
+        else:
+            conn = get_connection()
+            conn.execute(
+                """
+                UPDATE chemicals
+                SET chemical_name=?,
+                    description=?,
+                    cas_number=?,
+                    manufacturer=?,
+                    catalog_number=?,
+                    lot_number=?,
+                    amount=?,
+                    initial_amount=?,
+                    remaining_amount=?,
+                    unit=?,
+                    storage_unit_id=?,
+                    shelf_number=?,
+                    location=?,
+                    owner=?,
+                    expiration_date=?,
+                    status=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    edit_name.strip(),
+                    edit_description.strip(),
+                    edit_cas.strip(),
+                    edit_manufacturer.strip(),
+                    edit_catalog.strip(),
+                    edit_lot.strip(),
+                    edit_initial,
+                    edit_initial,
+                    edit_remaining,
+                    edit_unit,
+                    edit_storage[0],
+                    edit_storage[1],
+                    edit_storage[2] if edit_storage[0] is not None else "",
+                    edit_owner.strip(),
+                    edit_expiration.strip(),
+                    edit_status,
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    chemical_id,
+                ),
+            )
+            write_audit_log(
+                "EDIT_CHEMICAL",
+                target_type="chemical",
+                target_id=chemical_id,
+                bottle_id=chemical["bottle_id"],
+                details=json.dumps(
+                    {
+                        "chemical_name": edit_name.strip(),
+                        "remaining_amount": edit_remaining,
+                        "unit": edit_unit,
+                        "location": (
+                            edit_storage[2]
+                            if edit_storage[0] is not None
+                            else "Not Assigned"
+                        ),
+                        "owner": edit_owner.strip(),
+                        "status": edit_status,
+                    },
+                    ensure_ascii=False,
+                ),
+                conn=conn,
+            )
+            conn.commit()
+            conn.close()
+            set_notice("✅ Chemical information has been updated.")
+            st.rerun()
+
+    if cancel_edit:
+        st.rerun()
+
 @st.dialog("🗑️ Dispose Chemical", width="medium")
 def dispose_chemical_dialog(chemical_id):
     conn = get_connection()
@@ -2172,6 +2389,7 @@ elif menu == "Add Chemical":
     )
 
     storage_options = get_storage_options()
+    registration_date = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
     with st.form("add_chemical_form", clear_on_submit=True, enter_to_submit=False):
         chemical_name = st.text_input("Chemical Name *")
@@ -2208,6 +2426,14 @@ elif menu == "Add Chemical":
             ["Unopened", "In Use", "Disposal Pending"],
         )
 
+        st.date_input(
+            "Registration Date",
+            value=registration_date,
+            disabled=True,
+            format="YYYY-MM-DD",
+            help="Automatically set to today's date when the chemical is registered.",
+        )
+
         submitted = st.form_submit_button("Register Chemical", type="primary")
 
     if submitted:
@@ -2221,10 +2447,10 @@ elif menu == "Add Chemical":
                     chemical_name, description, cas_number, manufacturer,
                     catalog_number, lot_number, amount, initial_amount,
                     remaining_amount, unit, storage_unit_id, shelf_number,
-                    location, owner, expiration_date, status, created_at,
-                    updated_at
+                    location, owner, expiration_date, status, source_registered_date,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chemical_name.strip(),
@@ -2243,6 +2469,7 @@ elif menu == "Add Chemical":
                     owner.strip(),
                     expiration_date.strip(),
                     status,
+                    registration_date.strftime("%Y-%m-%d"),
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
                 ),
@@ -3930,210 +4157,15 @@ elif menu == "Inventory Management":
                 with cols[6]:
                     edit_col, dispose_col = st.columns([1, 1.35])
                     if edit_col.button("Edit", key=f"edit_{chemical['id']}"):
-                        st.session_state["edit_candidate"] = chemical["id"]
-                        st.rerun()
+                        edit_chemical_dialog(chemical["id"])
 
                     if dispose_col.button(
                         "Dispose", key=f"dispose_{chemical['id']}"
                     ):
-                        st.session_state.pop("edit_candidate", None)
                         dispose_chemical_dialog(chemical["id"])
                 st.divider()
         else:
             st.info("No active chemicals found.")
-
-        # ----------------------------------------------------
-        # Edit chemical
-        # ----------------------------------------------------
-        if "edit_candidate" in st.session_state:
-            edit_id = st.session_state["edit_candidate"]
-            conn = get_connection()
-            chemical = conn.execute(
-                "SELECT * FROM chemicals WHERE id=?",
-                (edit_id,),
-            ).fetchone()
-            conn.close()
-
-            if chemical:
-                st.subheader(f"✏️ Edit Chemical — {chemical['chemical_name']}")
-                st.caption(
-                    f"Bottle ID: {chemical['bottle_id'] or '-'}   |   Legacy ID: {chemical['legacy_id'] or '-'}"
-                )
-
-                storage_options = get_storage_options()
-                storage_index = current_location_index(
-                    storage_options,
-                    chemical["storage_unit_id"],
-                    chemical["shelf_number"],
-                )
-
-                unit_options = ["g", "mg", "kg", "mL", "L", "ea"]
-                current_unit = chemical["unit"] or "g"
-                if current_unit not in unit_options:
-                    unit_options.append(current_unit)
-
-                status_options = ["Unopened", "In Use", "Disposal Pending"]
-                current_status = chemical["status"]
-                if current_status not in status_options:
-                    status_options.append(current_status)
-
-                with st.form("edit_chemical_form", enter_to_submit=False):
-                    edit_name = st.text_input(
-                        "Chemical Name *", value=chemical["chemical_name"] or ""
-                    )
-                    edit_description = st.text_input(
-                        "Description / Grade", value=chemical["description"] or ""
-                    )
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        edit_cas = st.text_input(
-                            "CAS No.", value=chemical["cas_number"] or ""
-                        )
-                        edit_manufacturer = st.text_input(
-                            "Manufacturer", value=chemical["manufacturer"] or ""
-                        )
-                        edit_catalog = st.text_input(
-                            "Catalog No.", value=chemical["catalog_number"] or ""
-                        )
-                        edit_lot = st.text_input(
-                            "Lot No.", value=chemical["lot_number"] or ""
-                        )
-                        edit_initial = st.number_input(
-                            "Initial Amount",
-                            min_value=0.0,
-                            value=float(
-                                chemical["initial_amount"]
-                                if chemical["initial_amount"] is not None
-                                else chemical["amount"] or 0
-                            ),
-                        )
-
-                    with col2:
-                        edit_remaining = st.number_input(
-                            "Remaining Amount",
-                            min_value=0.0,
-                            value=float(
-                                chemical["remaining_amount"]
-                                if chemical["remaining_amount"] is not None
-                                else chemical["amount"] or 0
-                            ),
-                        )
-                        edit_unit = st.selectbox(
-                            "Unit",
-                            unit_options,
-                            index=unit_options.index(current_unit),
-                        )
-                        edit_storage = st.selectbox(
-                            "Storage Location",
-                            storage_options,
-                            index=storage_index,
-                            format_func=lambda option: option[2],
-                        )
-                        edit_owner = st.text_input(
-                            "Owner / Person in Charge", value=chemical["owner"] or ""
-                        )
-                        edit_expiration = st.text_input(
-                            "Expiration Date",
-                            value=chemical["expiration_date"] or "",
-                            placeholder="YYYY-MM-DD",
-                        )
-
-                    edit_status = st.selectbox(
-                        "Status",
-                        status_options,
-                        index=status_options.index(current_status),
-                    )
-
-                    save_col, cancel_col = st.columns(2)
-                    with save_col:
-                        save_edit = st.form_submit_button(
-                            "Save Changes", type="primary"
-                        )
-                    with cancel_col:
-                        cancel_edit = st.form_submit_button("Cancel")
-
-                    if save_edit:
-                        if not edit_name.strip():
-                            st.error("Chemical name is required.")
-                        else:
-                            conn = get_connection()
-                            conn.execute(
-                                """
-                                UPDATE chemicals
-                                SET chemical_name=?,
-                                    description=?,
-                                    cas_number=?,
-                                    manufacturer=?,
-                                    catalog_number=?,
-                                    lot_number=?,
-                                    amount=?,
-                                    initial_amount=?,
-                                    remaining_amount=?,
-                                    unit=?,
-                                    storage_unit_id=?,
-                                    shelf_number=?,
-                                    location=?,
-                                    owner=?,
-                                    expiration_date=?,
-                                    status=?,
-                                    updated_at=?
-                                WHERE id=?
-                                """,
-                                (
-                                    edit_name.strip(),
-                                    edit_description.strip(),
-                                    edit_cas.strip(),
-                                    edit_manufacturer.strip(),
-                                    edit_catalog.strip(),
-                                    edit_lot.strip(),
-                                    edit_initial,
-                                    edit_initial,
-                                    edit_remaining,
-                                    edit_unit,
-                                    edit_storage[0],
-                                    edit_storage[1],
-                                    edit_storage[2]
-                                    if edit_storage[0] is not None
-                                    else "",
-                                    edit_owner.strip(),
-                                    edit_expiration.strip(),
-                                    edit_status,
-                                    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                    edit_id,
-                                ),
-                            )
-                            write_audit_log(
-                                "EDIT_CHEMICAL",
-                                target_type="chemical",
-                                target_id=edit_id,
-                                bottle_id=chemical["bottle_id"],
-                                details=json.dumps(
-                                    {
-                                        "chemical_name": edit_name.strip(),
-                                        "remaining_amount": edit_remaining,
-                                        "unit": edit_unit,
-                                        "location": (
-                                            edit_storage[2]
-                                            if edit_storage[0] is not None
-                                            else "Not Assigned"
-                                        ),
-                                        "owner": edit_owner.strip(),
-                                        "status": edit_status,
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                conn=conn,
-                            )
-                            conn.commit()
-                            conn.close()
-                            st.session_state.pop("edit_candidate", None)
-                            set_notice("✅ Chemical information has been updated.")
-                            st.rerun()
-
-                    if cancel_edit:
-                        st.session_state.pop("edit_candidate", None)
-                        st.rerun()
 
     # --------------------------------------------------------
     # Disposal history
