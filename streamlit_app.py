@@ -192,18 +192,34 @@ footer {
 
 
 def _database_url():
-    """Use Codespaces env var locally, Streamlit Secrets in deployment."""
+    """Use Codespaces env var locally or Streamlit Secrets in deployment."""
     env_url = os.getenv("SUPABASE_DB_URL", "").strip()
     if env_url:
         return env_url
 
+    # Streamlit Community Cloud exposes top-level secrets as environment
+    # variables in many deployments, but also support direct st.secrets access.
     try:
-        return st.secrets["database"]["url"]
+        direct_url = str(st.secrets.get("SUPABASE_DB_URL", "")).strip()
+        if direct_url:
+            return direct_url
+    except Exception:
+        pass
+
+    try:
+        nested_url = str(st.secrets["database"]["url"]).strip()
+        if nested_url:
+            return nested_url
     except Exception as exc:
         raise RuntimeError(
             "Supabase database URL is not configured. "
-            "Set SUPABASE_DB_URL locally or add [database] url to Streamlit Secrets."
+            "Set SUPABASE_DB_URL locally or add it to Streamlit Secrets."
         ) from exc
+
+    raise RuntimeError(
+        "Supabase database URL is not configured. "
+        "Set SUPABASE_DB_URL locally or add it to Streamlit Secrets."
+    )
 
 
 def _translate_qmarks(sql):
@@ -433,6 +449,50 @@ def init_db():
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id BIGSERIAL PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            display_name TEXT,
+            role TEXT NOT NULL DEFAULT 'member',
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TEXT,
+            updated_at TEXT,
+            created_by TEXT
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id BIGSERIAL PRIMARY KEY,
+            user_email TEXT NOT NULL,
+            user_name TEXT,
+            action TEXT NOT NULL,
+            target_type TEXT,
+            target_id BIGINT,
+            bottle_id TEXT,
+            details TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users(LOWER(email))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_logs(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_user_email ON audit_logs(LOWER(user_email))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)"
+    )
+
     # Keep status and amount fields normalized without changing user data.
     status_mapping = {
         "미개봉": "Unopened",
@@ -654,6 +714,214 @@ def set_notice(message):
 
 
 # ============================================================
+# AUTHENTICATION / USERS / AUDIT
+# ============================================================
+
+def _secret_text(name):
+    """Read a top-level secret from env or Streamlit Secrets."""
+    env_value = os.getenv(name, "").strip()
+    if env_value:
+        return env_value
+
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
+def write_audit_log(
+    action,
+    target_type=None,
+    target_id=None,
+    bottle_id=None,
+    details=None,
+    conn=None,
+    user=None,
+):
+    """Write one user activity record. Reuse an existing transaction when supplied."""
+    actor = user or globals().get("CURRENT_USER") or {}
+    user_email = str(actor.get("email") or "system").strip().lower()
+    user_name = str(actor.get("name") or actor.get("display_name") or user_email).strip()
+
+    owns_connection = conn is None
+    if owns_connection:
+        conn = get_connection()
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO audit_logs (
+                user_email, user_name, action, target_type,
+                target_id, bottle_id, details, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_email,
+                user_name,
+                action,
+                target_type,
+                target_id,
+                bottle_id,
+                details,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        if owns_connection:
+            conn.commit()
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def _get_app_user(email):
+    email = str(email or "").strip().lower()
+    if not email:
+        return None
+
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT id, email, display_name, role, active
+        FROM app_users
+        WHERE LOWER(email)=LOWER(?)
+        """,
+        (email,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def _bootstrap_admin_if_allowed(email, identity_name):
+    """
+    Create the first/declared administrator only when the signed-in email
+    exactly matches BOOTSTRAP_ADMIN_EMAIL from Streamlit Secrets.
+    """
+    bootstrap_email = _secret_text("BOOTSTRAP_ADMIN_EMAIL").lower()
+    email = str(email or "").strip().lower()
+
+    if not bootstrap_email or email != bootstrap_email:
+        return None
+
+    existing = _get_app_user(email)
+    if existing:
+        return existing
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO app_users (
+            email, display_name, role, active,
+            created_at, updated_at, created_by
+        )
+        VALUES (?, ?, 'admin', TRUE, ?, ?, ?)
+        ON CONFLICT(email) DO NOTHING
+        """,
+        (
+            email,
+            identity_name or email,
+            now,
+            now,
+            "BOOTSTRAP_ADMIN_EMAIL",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return _get_app_user(email)
+
+
+def _login_screen():
+    st.markdown(
+        """
+<div style="max-width:620px; margin:7rem auto 0 auto; background:#FFFFFF;
+padding:36px; border:1px solid #E5E7EB; border-radius:18px; text-align:center;">
+<div style="font-size:32px; font-weight:700; color:#172033;">🧪 ICL Chemical Manager</div>
+<div style="margin-top:8px; color:#64748B;">
+Laboratory Chemical Inventory Management System
+</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.write("")
+    left, middle, right = st.columns([1, 1.3, 1])
+    with middle:
+        st.button(
+            "Sign in with Google",
+            type="primary",
+            width="stretch",
+            on_click=st.login,
+        )
+
+
+def require_authenticated_user():
+    """Require Google OIDC login and an active app_users whitelist entry."""
+    try:
+        logged_in = bool(st.user.is_logged_in)
+    except Exception:
+        st.error(
+            "Authentication is not configured yet. Add the [auth] Google OIDC "
+            "settings to this app's Streamlit Secrets."
+        )
+        st.stop()
+
+    if not logged_in:
+        _login_screen()
+        st.stop()
+
+    identity = st.user.to_dict()
+    email = str(identity.get("email") or "").strip().lower()
+    identity_name = str(
+        identity.get("name")
+        or identity.get("given_name")
+        or email
+    ).strip()
+
+    if not email:
+        st.error("Your Google account did not provide an email address.")
+        if st.button("Log out"):
+            st.logout()
+        st.stop()
+
+    app_user = _get_app_user(email)
+    if app_user is None:
+        app_user = _bootstrap_admin_if_allowed(email, identity_name)
+
+    if app_user is None or not bool(app_user["active"]):
+        st.error("⛔ This Google account is not authorized to use ICL Chemical Manager.")
+        st.caption(f"Signed in as: {email}")
+        if not _secret_text("BOOTSTRAP_ADMIN_EMAIL"):
+            st.info(
+                "Initial setup: add BOOTSTRAP_ADMIN_EMAIL to Streamlit Secrets "
+                "using the Google email that should become the first administrator."
+            )
+        st.button("Log out", on_click=st.logout)
+        st.stop()
+
+    current_user = {
+        "id": app_user["id"],
+        "email": str(app_user["email"]).strip().lower(),
+        "name": str(app_user["display_name"] or identity_name or email).strip(),
+        "role": str(app_user["role"] or "member").strip().lower(),
+    }
+
+    if not st.session_state.get("_login_audit_written"):
+        write_audit_log(
+            "LOGIN",
+            target_type="session",
+            details="Google OIDC login",
+            user=current_user,
+        )
+        st.session_state["_login_audit_written"] = True
+
+    return current_user
+
+
+CURRENT_USER = require_authenticated_user()
+
+
+# ============================================================
 # SAFETY / PUBCHEM HELPERS
 # ============================================================
 
@@ -852,6 +1120,13 @@ def save_pubchem_safety(chemical_id, safety):
             datetime.now().strftime("%Y-%m-%d %H:%M"),
             chemical_id,
         ),
+    )
+    write_audit_log(
+        "SAFETY_SCREENING",
+        target_type="chemical",
+        target_id=chemical_id,
+        details=f"PubChem CID: {safety.get('cid', '')}",
+        conn=conn,
     )
     conn.commit()
     conn.close()
@@ -1060,6 +1335,22 @@ def dispose_chemical_dialog(chemical_id):
                         chemical_id,
                     ),
                 )
+                write_audit_log(
+                    "DISPOSE_CHEMICAL",
+                    target_type="chemical",
+                    target_id=chemical_id,
+                    bottle_id=chemical["bottle_id"],
+                    details=json.dumps(
+                        {
+                            "chemical_name": chemical["chemical_name"],
+                            "reason": disposal_reason,
+                            "note": disposal_note.strip(),
+                            "location": chemical["location_text"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    conn=conn,
+                )
                 conn.commit()
                 conn.close()
 
@@ -1090,18 +1381,37 @@ st.sidebar.markdown("""
 
 st.sidebar.divider()
 
+st.sidebar.caption("Signed in as")
+st.sidebar.markdown(f"**{CURRENT_USER['name']}**")
+st.sidebar.caption(CURRENT_USER["email"])
+st.sidebar.caption(f"Role: {CURRENT_USER['role'].title()}")
+st.sidebar.button("Log out", on_click=st.logout, width="stretch")
+
+st.sidebar.divider()
+
+menu_items = [
+    "Chemical Search",
+    "Inventory Management",
+    "Storage Management",
+    "Excel Import",
+    "Excel Export",
+    "Add Chemical",
+    "SDS",
+]
+
+if CURRENT_USER["role"] == "admin":
+    menu_items.extend(
+        [
+            "User Management",
+            "Activity Log",
+        ]
+    )
+
+menu_items.append("Settings")
+
 menu = st.sidebar.radio(
     "Navigation",
-    [
-        "Chemical Search",
-        "Inventory Management",
-        "Storage Management",
-        "Excel Import",
-        "Excel Export",
-        "Add Chemical",
-        "SDS",
-        "Settings"
-    ],
+    menu_items,
     label_visibility="collapsed"
 )
 
@@ -1931,8 +2241,24 @@ elif menu == "Add Chemical":
             chemical_id = cursor.lastrowid
             bottle_id = f"ICL-{chemical_id:06d}"
             conn.execute(
-                "UPDATE chemicals SET bottle_id=? WHERE id=?",
-                (bottle_id, chemical_id),
+                "UPDATE chemicals SET bottle_id=?, registered_by=? WHERE id=?",
+                (bottle_id, CURRENT_USER["email"], chemical_id),
+            )
+            write_audit_log(
+                "ADD_CHEMICAL",
+                target_type="chemical",
+                target_id=chemical_id,
+                bottle_id=bottle_id,
+                details=json.dumps(
+                    {
+                        "chemical_name": chemical_name.strip(),
+                        "cas_number": cas_number.strip(),
+                        "manufacturer": manufacturer.strip(),
+                        "location": storage[2] if storage[0] is not None else "Not Assigned",
+                    },
+                    ensure_ascii=False,
+                ),
+                conn=conn,
             )
             conn.commit()
             conn.close()
@@ -2317,6 +2643,18 @@ elif menu == "Excel Import":
                                 )
                                 imported_count += 1
 
+                            write_audit_log(
+                                "EXCEL_IMPORT",
+                                target_type="bulk_import",
+                                details=json.dumps(
+                                    {
+                                        "imported_count": imported_count,
+                                        "source": uploaded_excel.name,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                conn=conn,
+                            )
                             conn.commit()
                             set_notice(
                                 f"✅ {imported_count:,} chemical(s) imported successfully."
@@ -2933,6 +3271,13 @@ elif menu == "Storage Management":
                             next_shelf
                         )
                     )
+                    write_audit_log(
+                        "ADD_SHELF",
+                        target_type="storage_unit",
+                        target_id=storage_id,
+                        details=f"Added Shelf {next_shelf} to {storage['storage_name']}",
+                        conn=conn,
+                    )
 
                     conn.commit()
                     conn.close()
@@ -3079,6 +3424,20 @@ elif menu == "Storage Management":
                                         new_notes.strip(),
                                         storage_id
                                     )
+                                )
+                                write_audit_log(
+                                    "EDIT_STORAGE",
+                                    target_type="storage_unit",
+                                    target_id=storage_id,
+                                    details=json.dumps(
+                                        {
+                                            "old_name": storage["storage_name"],
+                                            "new_name": new_storage_name.strip(),
+                                            "notes": new_notes.strip(),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    conn=conn,
                                 )
 
                                 conn.commit()
@@ -3244,6 +3603,20 @@ elif menu == "Storage Management":
                                 )
                             )
 
+                        write_audit_log(
+                            "ADD_STORAGE",
+                            target_type="storage_unit",
+                            target_id=new_storage_id,
+                            details=json.dumps(
+                                {
+                                    "storage_name": storage_name.strip(),
+                                    "shelf_count": int(shelf_count),
+                                    "notes": notes.strip(),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            conn=conn,
+                        )
                         conn.commit()
                         conn.close()
 
@@ -3717,6 +4090,28 @@ elif menu == "Inventory Management":
                                     edit_id,
                                 ),
                             )
+                            write_audit_log(
+                                "EDIT_CHEMICAL",
+                                target_type="chemical",
+                                target_id=edit_id,
+                                bottle_id=chemical["bottle_id"],
+                                details=json.dumps(
+                                    {
+                                        "chemical_name": edit_name.strip(),
+                                        "remaining_amount": edit_remaining,
+                                        "unit": edit_unit,
+                                        "location": (
+                                            edit_storage[2]
+                                            if edit_storage[0] is not None
+                                            else "Not Assigned"
+                                        ),
+                                        "owner": edit_owner.strip(),
+                                        "status": edit_status,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                conn=conn,
+                            )
                             conn.commit()
                             conn.close()
                             st.session_state.pop("edit_candidate", None)
@@ -4094,6 +4489,22 @@ elif menu == "SDS":
                             datetime.now().strftime("%Y-%m-%d %H:%M"),
                         ),
                     )
+                    write_audit_log(
+                        "SAVE_SDS",
+                        target_type="chemical",
+                        target_id=selected_id,
+                        bottle_id=chemical["bottle_id"],
+                        details=json.dumps(
+                            {
+                                "source_name": source_name.strip(),
+                                "source_url": source_url.strip(),
+                                "revision_date": revision_date.strip(),
+                                "file_name": file_name,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        conn=conn,
+                    )
                     conn.commit()
                     conn.close()
                     set_notice("✅ Official SDS record has been saved.")
@@ -4108,6 +4519,14 @@ elif menu == "SDS":
                     conn.execute(
                         "DELETE FROM sds_documents WHERE chemical_id=?",
                         (selected_id,),
+                    )
+                    write_audit_log(
+                        "REMOVE_SDS",
+                        target_type="chemical",
+                        target_id=selected_id,
+                        bottle_id=chemical["bottle_id"],
+                        details="Removed attached official SDS record",
+                        conn=conn,
                     )
                     conn.commit()
                     conn.close()
@@ -4127,6 +4546,353 @@ elif menu == "SDS":
         )
 
 
+
+# ============================================================
+# USER MANAGEMENT
+# ============================================================
+
+elif menu == "User Management":
+    if CURRENT_USER["role"] != "admin":
+        st.error("Administrator access is required.")
+        st.stop()
+
+    st.header("👥 User Management")
+    st.caption(
+        "Only active users listed here can access the laboratory inventory after Google sign-in."
+    )
+
+    conn = get_connection()
+    users = conn.execute(
+        """
+        SELECT id, email, display_name, role, active, created_at, updated_at, created_by
+        FROM app_users
+        ORDER BY active DESC, role, LOWER(email)
+        """
+    ).fetchall()
+    conn.close()
+
+    active_users = sum(1 for user in users if bool(user["active"]))
+    admin_users = sum(
+        1
+        for user in users
+        if bool(user["active"]) and str(user["role"]).lower() == "admin"
+    )
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Registered Users", len(users))
+    metric2.metric("Active Users", active_users)
+    metric3.metric("Active Admins", admin_users)
+
+    st.divider()
+    st.subheader("Add or Update User")
+
+    user_choices = ["➕ New user"] + [user["email"] for user in users]
+    selected_user_choice = st.selectbox(
+        "User",
+        user_choices,
+        key="user_management_selector",
+    )
+
+    selected_user = None
+    if selected_user_choice != "➕ New user":
+        selected_user = next(
+            (user for user in users if user["email"] == selected_user_choice),
+            None,
+        )
+
+    default_email = selected_user["email"] if selected_user else ""
+    default_name = selected_user["display_name"] if selected_user else ""
+    default_role = (
+        str(selected_user["role"] or "member").lower()
+        if selected_user
+        else "member"
+    )
+    default_active = bool(selected_user["active"]) if selected_user else True
+
+    role_options = ["member", "admin"]
+    if default_role not in role_options:
+        role_options.append(default_role)
+
+    with st.form("manage_user_form", enter_to_submit=False):
+        user_email = st.text_input(
+            "Google Account Email *",
+            value=default_email,
+            disabled=selected_user is not None,
+            placeholder="name@example.com",
+        )
+        display_name = st.text_input(
+            "Display Name",
+            value=default_name or "",
+            placeholder="Name shown in audit records",
+        )
+        role = st.selectbox(
+            "Role",
+            role_options,
+            index=role_options.index(default_role),
+            help="Admins can manage users and view the full activity log.",
+        )
+        active = st.checkbox(
+            "Active",
+            value=default_active,
+            help="Inactive users can sign in to Google but cannot access the inventory.",
+        )
+        save_user = st.form_submit_button(
+            "Save User",
+            type="primary",
+        )
+
+    if save_user:
+        normalized_email = user_email.strip().lower()
+        normalized_name = display_name.strip() or normalized_email
+
+        if not normalized_email or "@" not in normalized_email:
+            st.error("Enter a valid Google account email.")
+        elif (
+            normalized_email == CURRENT_USER["email"]
+            and (not active or role != "admin")
+        ):
+            st.error(
+                "You cannot deactivate or remove admin rights from your own current account."
+            )
+        else:
+            conn = get_connection()
+            existing = conn.execute(
+                """
+                SELECT id, email, role, active
+                FROM app_users
+                WHERE LOWER(email)=LOWER(?)
+                """,
+                (normalized_email,),
+            ).fetchone()
+
+            # Protect the last active administrator.
+            if (
+                existing
+                and str(existing["role"]).lower() == "admin"
+                and bool(existing["active"])
+                and (role != "admin" or not active)
+            ):
+                active_admin_count = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM app_users
+                    WHERE active=TRUE AND LOWER(role)='admin'
+                    """
+                ).fetchone()[0]
+
+                if active_admin_count <= 1:
+                    conn.close()
+                    st.error("At least one active administrator must remain.")
+                    st.stop()
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE app_users
+                    SET display_name=?,
+                        role=?,
+                        active=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        normalized_name,
+                        role,
+                        active,
+                        now,
+                        existing["id"],
+                    ),
+                )
+                user_id = existing["id"]
+                audit_action = "EDIT_USER"
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO app_users (
+                        email, display_name, role, active,
+                        created_at, updated_at, created_by
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_email,
+                        normalized_name,
+                        role,
+                        active,
+                        now,
+                        now,
+                        CURRENT_USER["email"],
+                    ),
+                )
+                user_id = cursor.lastrowid
+                audit_action = "ADD_USER"
+
+            write_audit_log(
+                audit_action,
+                target_type="user",
+                target_id=user_id,
+                details=json.dumps(
+                    {
+                        "email": normalized_email,
+                        "display_name": normalized_name,
+                        "role": role,
+                        "active": active,
+                    },
+                    ensure_ascii=False,
+                ),
+                conn=conn,
+            )
+            conn.commit()
+            conn.close()
+            set_notice(f"✅ User settings saved for {normalized_email}.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("Registered Users")
+
+    if users:
+        user_table = []
+        for user in users:
+            user_table.append(
+                {
+                    "Name": user["display_name"] or "-",
+                    "Email": user["email"],
+                    "Role": str(user["role"] or "member").title(),
+                    "Status": "Active" if bool(user["active"]) else "Inactive",
+                    "Created": user["created_at"] or "-",
+                }
+            )
+
+        st.dataframe(
+            user_table,
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("No users are registered yet.")
+
+
+# ============================================================
+# ACTIVITY LOG
+# ============================================================
+
+elif menu == "Activity Log":
+    if CURRENT_USER["role"] != "admin":
+        st.error("Administrator access is required.")
+        st.stop()
+
+    st.header("📋 Activity Log")
+    st.caption(
+        "Shows who registered, edited, moved, disposed of, or otherwise changed laboratory records."
+    )
+
+    conn = get_connection()
+    action_rows = conn.execute(
+        """
+        SELECT DISTINCT action
+        FROM audit_logs
+        WHERE action IS NOT NULL AND TRIM(action) != ''
+        ORDER BY action
+        """
+    ).fetchall()
+    conn.close()
+
+    action_options = ["All Actions"] + [row["action"] for row in action_rows]
+
+    filter1, filter2 = st.columns([2.5, 1.2])
+    with filter1:
+        activity_search = st.text_input(
+            "Search Activity",
+            placeholder="User, email, action, Bottle ID, details...",
+        )
+    with filter2:
+        selected_action = st.selectbox(
+            "Action",
+            action_options,
+        )
+
+    conditions = []
+    params = []
+
+    if activity_search.strip():
+        like = f"%{activity_search.strip()}%"
+        conditions.append(
+            """
+            (
+                   user_name ILIKE ?
+                OR user_email ILIKE ?
+                OR action ILIKE ?
+                OR bottle_id ILIKE ?
+                OR details ILIKE ?
+            )
+            """
+        )
+        params.extend([like] * 5)
+
+    if selected_action != "All Actions":
+        conditions.append("action=?")
+        params.append(selected_action)
+
+    where_sql = ""
+    if conditions:
+        where_sql = "WHERE " + " AND ".join(conditions)
+
+    conn = get_connection()
+    logs = conn.execute(
+        f"""
+        SELECT
+            created_at,
+            user_name,
+            user_email,
+            action,
+            target_type,
+            target_id,
+            bottle_id,
+            details
+        FROM audit_logs
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT 1000
+        """,
+        params,
+    ).fetchall()
+    conn.close()
+
+    st.caption(f"{len(logs):,} activity record(s) shown")
+
+    if logs:
+        display_logs = []
+        for log in logs:
+            display_logs.append(
+                {
+                    "Time": log["created_at"],
+                    "User": log["user_name"] or "-",
+                    "Email": log["user_email"],
+                    "Action": log["action"],
+                    "Bottle ID": log["bottle_id"] or "-",
+                    "Target": (
+                        f"{log['target_type'] or '-'}"
+                        + (
+                            f" #{log['target_id']}"
+                            if log["target_id"] is not None
+                            else ""
+                        )
+                    ),
+                    "Details": log["details"] or "-",
+                }
+            )
+
+        st.dataframe(
+            display_logs,
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("No activity records match the selected filters.")
+
+
 # ============================================================
 # SETTINGS
 # ============================================================
@@ -4142,20 +4908,32 @@ elif menu == "Settings":
         "SELECT COUNT(*) FROM chemicals WHERE status='Disposed'"
     ).fetchone()[0]
     storage_count = conn.execute("SELECT COUNT(*) FROM storage_units").fetchone()[0]
+    user_count = conn.execute(
+        "SELECT COUNT(*) FROM app_users WHERE active=TRUE"
+    ).fetchone()[0]
+    audit_count = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
     conn.close()
 
     st.subheader("System Information")
-    st.write(f"Database: SQLite (`{DB_FILE}`)")
+    st.write("Database: Supabase PostgreSQL")
+    st.write(f"Signed in as: {CURRENT_USER['name']} ({CURRENT_USER['email']})")
+    st.write(f"Role: {CURRENT_USER['role'].title()}")
     st.write(f"Active chemicals: {active_count:,}")
     st.write(f"Disposed chemicals: {disposed_count:,}")
     st.write(f"Storage units: {storage_count:,}")
+    st.write(f"Active users: {user_count:,}")
+    st.write(f"Audit records: {audit_count:,}")
 
     st.divider()
     st.subheader("Current Features")
     st.write(
         """
+        - Google OIDC login
+        - Approved-user whitelist with Admin / Member roles
+        - User activity / audit logging
         - Manual chemical registration
         - Lab Manager Excel bulk import
+        - Excel inventory export
         - Automatic Bottle ID generation
         - Legacy management ID retention
         - Storage-unit auto creation from Excel
@@ -4176,10 +4954,10 @@ elif menu == "Settings":
     st.write(
         """
         - QR code generation
-        - User login and audit trail
         - Manufacturer-specific SDS auto-discovery
         - AI-assisted chemical label recognition
         - AI SDS summarization
         - Natural-language inventory search
+        - Automated backup / reporting
         """
     )
