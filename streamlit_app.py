@@ -336,9 +336,17 @@ def get_connection():
     return CompatConnection(raw)
 
 
+@st.cache_resource(show_spinner=False)
 def init_db():
-    """Ensure the Supabase schema exists. Existing migrated data are preserved."""
+    """Initialize the Supabase schema once per app process.
+
+    A PostgreSQL transaction-level advisory lock serializes schema initialization
+    so simultaneous Streamlit sessions cannot deadlock while creating indexes.
+    """
     conn = get_connection()
+
+    # Prevent concurrent app sessions from running DDL/index creation together.
+    conn.execute("SELECT pg_advisory_xact_lock(742013)")
 
     conn.execute(
         """
@@ -552,6 +560,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    return True
 
 
 init_db()
