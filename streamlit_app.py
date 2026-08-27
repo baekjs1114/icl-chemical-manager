@@ -4114,6 +4114,11 @@ elif menu == "Inventory Management":
                 c.owner,
                 c.expiration_date,
                 c.status,
+                COALESCE(
+                    NULLIF(c.source_registered_date, ''),
+                    LEFT(c.created_at, 10),
+                    '-'
+                ) AS registered_date,
                 c.storage_unit_id,
                 c.shelf_number,
                 {LOCATION_EXPR} AS location_text
@@ -4131,18 +4136,19 @@ elif menu == "Inventory Management":
         st.caption(f"{total_rows:,} active chemical(s)")
 
         if rows:
-            header = st.columns([1.5, 3.0, 2.0, 1.3, 2.7, 1.4, 2.8])
+            header = st.columns([1.45, 2.8, 1.9, 1.25, 2.35, 1.25, 1.55, 2.5])
             header[0].markdown("**Bottle ID**")
             header[1].markdown("**Chemical**")
             header[2].markdown("**Manufacturer**")
             header[3].markdown("**Remaining**")
             header[4].markdown("**Location**")
             header[5].markdown("**Status**")
-            header[6].markdown("**Action**")
+            header[6].markdown("**Registered**")
+            header[7].markdown("**Action**")
             st.divider()
 
             for chemical in rows:
-                cols = st.columns([1.5, 3.0, 2.0, 1.3, 2.7, 1.4, 2.8])
+                cols = st.columns([1.45, 2.8, 1.9, 1.25, 2.35, 1.25, 1.55, 2.5])
                 cols[0].write(chemical["bottle_id"] or "-")
                 cols[1].write(chemical["chemical_name"])
                 cols[2].write(chemical["manufacturer"] or "-")
@@ -4153,8 +4159,9 @@ elif menu == "Inventory Management":
                 cols[3].write(amount_text)
                 cols[4].write(chemical["location_text"])
                 cols[5].write(chemical["status"])
+                cols[6].write(chemical["registered_date"] or "-")
 
-                with cols[6]:
+                with cols[7]:
                     edit_col, dispose_col = st.columns([1, 1.35])
                     if edit_col.button("Edit", key=f"edit_{chemical['id']}"):
                         edit_chemical_dialog(chemical["id"])
