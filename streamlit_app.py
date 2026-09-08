@@ -3,7 +3,7 @@ import sys as _icl_sys
 import types as _icl_types
 _icl_guard = _icl_types.ModuleType("icl_ocr_ui_guard")
 _icl_guard.__file__ = __file__ + ":icl_ocr_ui_guard"
-exec(compile('"""Apply after all existing UI transformations; compatible with the supplied ICL app.\n\nThis module uses the application\'s existing requests and Streamlit objects. No ML\npackages or API key belong in the Streamlit repository.\n"""\nfrom __future__ import annotations\n\nimport ast\nimport hashlib\nimport json\n\n\ndef is_v8(result):\n    return isinstance(result, dict) and result.get("schema_version") == "icl.ocr.v8"\n\n\ndef candidates(result):\n    return list(result.get("review_candidates", [])) if is_v8(result) else []\n\n\ndef candidate_label(candidate):\n    sources = {"reviewed_reference": "확인한 제조사 참조", "official_product_page": "제조사 제품 페이지",\n               "pubchem_exact_cas_synonym": "PubChem CAS 대조", "inventory_unreviewed": "기존 재고 후보"}\n    parts = [str(candidate.get("name", ""))]\n    if candidate.get("cas"):\n        parts.append("CAS " + str(candidate["cas"]))\n    if candidate.get("catalog"):\n        parts.append(str(candidate.get("manufacturer", "")) + " " + str(candidate["catalog"]))\n    parts.append(sources.get(candidate.get("source"), "출처 확인 필요"))\n    return " | ".join(parts)\n\n\ndef metadata(result):\n    defaults = {"label_name": "", "verified_label_name": "", "verified_label_name_source": "",\n                "label_name_confidence": 0, "manufacturer": "", "catalog": "", "cas": "",\n                "catalog_candidates": [], "catalog_ambiguous": False, "catalog_confidence": 0,\n                "raw_cas_candidates": [], "cas_candidates": [], "cas_verified": False, "cas_ambiguous": False,\n                "lot": "", "purity": "", "amount": None, "unit": ""}\n    if is_v8(result):\n        defaults.update(result.get("metadata", {}))\n        defaults["label_name_confidence"] = defaults.get("label_name_confidence") or 0\n    return defaults\n\n\ndef review_key(result, candidate):\n    value = str(result.get("review_token", "")) + ":" + str(candidate.get("candidate_id", ""))\n    return "icl_v8_review_" + hashlib.sha256(value.encode()).hexdigest()[:20]\n\n\ndef choice_key(result):\n    value = str(result.get("scan_id")) + ":" + str(result.get("review_token", ""))\n    return "icl_v8_choice_" + hashlib.sha256(value.encode()).hexdigest()[:20]\n\n\ndef render_review(env, result):\n    st = env["st"]\n    if not is_v8(result):\n        st.warning("이전 OCR 결과입니다. 새 OCR API로 다시 판독하세요.")\n        return\n    state = result.get("verification_status")\n    if state == "PRODUCT_VERIFIED":\n        st.success("제품 정보 확인 — 저장할 이름은 확인된 제품명을 사용합니다.")\n    elif state == "IDENTITY_VERIFIED":\n        st.info("물질 확인 — 제조사/제품번호는 별도 확인이 필요할 수 있습니다.")\n    elif state == "CONFLICT":\n        st.error("식별 정보 충돌 — 사진 그룹 또는 라벨을 확인하세요. 자동 적용할 수 없습니다.")\n    else:\n        st.warning("미확정 — 아래 후보와 원본을 비교한 뒤 선택하세요.")\n    for item in result.get("conflicts", []):\n        st.error(item)\n    with st.expander("OCR 원문과 제품 조회 근거"):\n        st.code("\\n".join(o["text"] for o in result.get("observations", []) if o.get("pass_id") == "full"))\n        st.json({"fields": result.get("fields", {}), "lookups": result.get("lookup_events", []),\n                 "warnings": result.get("warnings", []), "runtime": result.get("runtime", {})})\n    packages = result.get("fields", {}).get("package", [])\n    if packages:\n        st.caption("판독한 포장 표기: " + " / ".join(dict.fromkeys(x["value"] for x in packages)) + " · 현재 잔량은 직접 입력하세요.")\n\n\ndef render_candidate(env, result, candidate):\n    if not is_v8(result):\n        return\n    st = env["st"]\n    st.write("적용할 이름: **" + str(candidate.get("name", "")) + "**")\n    st.write("CAS: " + str(candidate.get("cas", "")) + " · 제품번호: " + str(candidate.get("catalog", "")))\n    if candidate.get("source_url"):\n        st.markdown("[제품/물질 출처 확인](" + candidate["source_url"] + ")")\n    if not candidate.get("product_verified"):\n        st.checkbox("원본 라벨과 후보의 이름·CAS·제품번호를 대조했습니다.", key=review_key(result, candidate))\n\n\ndef _post(env, path, payload):\n    response = env["requests"].post(env["get_ocr_api_url"]().rstrip("/") + path,\n        headers={"X-API-Key": env["get_ocr_api_key"]()}, json=payload, timeout=60)\n    if response.status_code != 200:\n        raise ValueError("OCR API " + str(response.status_code) + ": " + response.text[:250])\n    return response.json()\n\n\ndef apply_result(env, result, original_bytes, filename, selected_candidate=None, source_scan_id=None, evidence_photos=None):\n    st = env["st"]\n    if not is_v8(result):\n        st.error("이전 OCR 결과를 적용할 수 없습니다. 새 API로 다시 판독하거나 수동으로 입력하세요.")\n        st.stop()\n    selected = selected_candidate or result.get("verified_identity")\n    if not selected:\n        st.warning("제품/물질 후보를 먼저 선택하세요. 확인할 수 없으면 수동 입력을 사용하세요.")\n        st.stop()\n    try:\n        draft = _post(env, "/draft", {"review_token": result.get("review_token"),\n            "candidate_id": selected.get("candidate_id"),\n            "reviewed": bool(st.session_state.get(review_key(result, selected), False))})\n    except Exception as exc:\n        st.error(str(exc))\n        st.stop()  # Prevent the old caller from displaying its success banner/rerun.\n    fields = draft["fields"]\n    for key, field in (("add_name", "name"), ("add_cas", "cas"), ("add_formula", "formula"),\n                       ("add_mw", "mw"), ("add_manufacturer", "manufacturer"), ("add_catalog", "catalog")):\n        value = fields.get(field)\n        st.session_state[key] = "" if value is None else str(value)\n    for key in ("add_lot", "add_purity", "add_description"):\n        st.session_state[key] = ""\n    # Clear a previous bottle\'s amount; no package quantity is inferred as remaining stock.\n    st.session_state["add_initial_amount"] = 0.0\n    st.session_state["add_remaining_amount"] = 0.0\n    st.session_state["add_unit"] = "g"\n    st.session_state["add_manufacturer_widget_needs_sync"] = True\n    st.session_state["add_ocr_result"] = result\n    st.session_state["add_ocr_original"] = original_bytes\n    st.session_state["add_ocr_filename"] = filename\n    st.session_state["icl_v8_registration_draft"] = draft\n    if evidence_photos is not None:\n        st.session_state["add_ocr_group_photos"] = evidence_photos\n    if source_scan_id:\n        st.session_state["add_source_scan_id"] = source_scan_id\n    st.session_state["_pending_navigation"] = "Add Chemical"\n    return draft\n\n\ndef merge_group(env, records, group_id):\n    successful = [r for r in records if not r.get("error") and r.get("result")]\n    base = {"group_id": group_id, "records": records, "result": {}, "error": "", "conflicts": []}\n    if not successful or not all(is_v8(r["result"]) for r in successful):\n        return {**base, "error": "새 OCR API로 이 그룹의 사진을 다시 판독하세요."}\n    unique = {r["result"]["scan_id"]: r for r in successful}\n    if len(unique) == 1:\n        return {**base, "result": next(iter(unique.values()))["result"], "conflicts": successful[0]["result"].get("conflicts", [])}\n    tokens = sorted(r["result"]["evidence_token"] for r in unique.values())\n    signature = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()\n    cache = env["st"].session_state.setdefault("icl_v8_group_cache", {})\n    try:\n        if signature not in cache:\n            # Errors are deliberately not cached. A subsequent rerun can retry 503s.\n            result = _post(env, "/resolve-group", {"evidence_tokens": tokens})\n            if not result.get("ok"):\n                raise ValueError("Group resolution failed")\n            cache[signature] = result\n        result = dict(cache[signature])\n        result["label_crop_base64"] = successful[0]["result"].get("label_crop_base64", "")\n        return {**base, "result": result, "conflicts": result.get("conflicts", [])}\n    except Exception as exc:\n        return {**base, "error": str(exc)}\n\n\ndef transform_source(source):\n    """Targeted source-span patches preserve unrelated UI and database code.\n\n    Run on the final UI-transformed source, including all fallback compile paths.\n    Unsupported source is an error, never a silently partial safety patch.\n    """\n    if "# ICL_V8_GUARD_APPLIED" in source:\n        return source\n    tree = ast.parse(source)\n    lines = source.splitlines(keepends=True)\n    offsets = [0]\n    for line in lines:\n        offsets.append(offsets[-1] + len(line))\n    def offset(lineno, byte_column):\n        # AST columns are UTF-8 byte offsets; Python string indices are characters.\n        return offsets[lineno - 1] + len(lines[lineno - 1].encode()[:byte_column].decode())\n    edits, found = [], set()\n    def replace(node, text):\n        edits.append((offset(node.lineno, node.col_offset), offset(node.end_lineno, node.end_col_offset), text))\n    helper = \'__import__("icl_ocr_ui_guard")\'\n    bodies = {\n        "ocr_candidate_label": f"return {helper}.candidate_label(candidate)",\n        "resolve_current_bottle_metadata": f"return {helper}.metadata(result)",\n        "merge_add_ocr_group": f"return {helper}.merge_group(globals(), records, group_id)",\n        "load_add_form_from_ocr": f"return {helper}.apply_result(globals(), result, original_bytes, filename, selected_candidate, source_scan_id, evidence_photos)",\n        "load_add_form_from_existing_bottle": f"return {helper}.apply_result(globals(), result, original_bytes, filename, source_scan_id=source_scan_id)",\n    }\n    replaced_regions = []\n    for node in tree.body:\n        if isinstance(node, ast.FunctionDef) and node.name in bodies:\n            found.add(node.name)\n            replace(node, "def " + node.name + "(" + ast.unparse(node.args) + "):\\n    " + bodies[node.name])\n            replaced_regions.append((node.lineno, node.end_lineno))\n    missing = set(bodies) - found\n    if missing:\n        raise ValueError("Unsupported Streamlit source; missing functions: " + ", ".join(sorted(missing)))\n    for node in ast.walk(tree):\n        if not hasattr(node, "lineno") or any(a <= node.lineno <= b for a, b in replaced_regions):\n            continue\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "add_candidates" for t in node.targets):\n            indent = " " * node.col_offset\n            replace(node, f"add_candidates = {helper}.candidates(add_ocr_result)\\n{indent}{helper}.render_review(globals(), add_ocr_result)")\n        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "chosen_candidate":\n            first = node.body[0]\n            start = offset(first.lineno, first.col_offset)\n            edits.append((start, start, f"{helper}.render_candidate(globals(), add_ocr_result, chosen_candidate)\\n" + " " * first.col_offset))\n        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "st":\n            if node.func.attr == "radio" and any(k.arg == "key" and isinstance(k.value, ast.Constant) and k.value.value == "add_chemical_candidate_choice" for k in node.keywords):\n                for k in node.keywords:\n                    if k.arg == "index":\n                        replace(k.value, "None")\n                    elif k.arg == "key":\n                        replace(k.value, f"{helper}.choice_key(add_ocr_result)")\n            if node.func.attr == "success" and node.args and isinstance(node.args[0], ast.Constant) and str(node.args[0].value) in ("Label fields verified", "Core label fields verified"):\n                replace(node, \'st.caption("필드 표시 완료 · 제품/물질 검증 상태는 아래에서 확인하세요.")\')\n    for start, end, text in sorted(edits, reverse=True):\n        source = source[:start] + text + source[end:]\n    source += "\\n# ICL_V8_GUARD_APPLIED\\n"\n    compile(source, "<ICL v8 guarded source>", "exec")\n    return source\n', _icl_guard.__file__, "exec"), _icl_guard.__dict__)
+exec(compile('"""Apply after all existing UI transformations; compatible with the supplied ICL app.\n\nThis module uses the application\'s existing requests and Streamlit objects. No ML\npackages or API key belong in the Streamlit repository.\n"""\nfrom __future__ import annotations\n\nimport ast\nimport hashlib\nimport json\n\n\ndef is_v8(result):\n    return isinstance(result, dict) and result.get("schema_version") == "icl.ocr.v8"\n\n\ndef candidates(result):\n    return list(result.get("review_candidates", [])) if is_v8(result) else []\n\n\ndef candidate_label(candidate):\n    sources = {"reviewed_reference": "Reviewed manufacturer reference", "official_product_page": "Manufacturer product page",\n               "pubchem_exact_cas_synonym": "PubChem CAS match", "inventory_unreviewed": "Existing inventory candidate"}\n    parts = [str(candidate.get("name", ""))]\n    if candidate.get("cas"):\n        parts.append("CAS " + str(candidate["cas"]))\n    if candidate.get("catalog"):\n        parts.append(str(candidate.get("manufacturer", "")) + " " + str(candidate["catalog"]))\n    parts.append(sources.get(candidate.get("source"), "Source needs review"))\n    return " | ".join(parts)\n\n\ndef metadata(result):\n    defaults = {"label_name": "", "verified_label_name": "", "verified_label_name_source": "",\n                "label_name_confidence": 0, "manufacturer": "", "catalog": "", "cas": "",\n                "catalog_candidates": [], "catalog_ambiguous": False, "catalog_confidence": 0,\n                "raw_cas_candidates": [], "cas_candidates": [], "cas_verified": False, "cas_ambiguous": False,\n                "lot": "", "purity": "", "amount": None, "unit": ""}\n    if is_v8(result):\n        defaults.update(result.get("metadata", {}))\n        defaults["label_name_confidence"] = defaults.get("label_name_confidence") or 0\n    return defaults\n\n\ndef review_key(result, candidate):\n    value = str(result.get("review_token", "")) + ":" + str(candidate.get("candidate_id", ""))\n    return "icl_v8_review_" + hashlib.sha256(value.encode()).hexdigest()[:20]\n\n\ndef choice_key(result):\n    value = str(result.get("scan_id")) + ":" + str(result.get("review_token", ""))\n    return "icl_v8_choice_" + hashlib.sha256(value.encode()).hexdigest()[:20]\n\n\ndef render_review(env, result):\n    st = env["st"]\n    if not is_v8(result):\n        st.warning("이전 OCR 결과입니다. 새 OCR API로 다시 판독하세요.")\n        return\n    state = result.get("verification_status")\n    if state == "PRODUCT_VERIFIED":\n        st.success("제품 정보 확인 — 저장할 이름은 확인된 제품명을 사용합니다.")\n    elif state == "IDENTITY_VERIFIED":\n        st.info("물질 확인 — 제조사/제품번호는 별도 확인이 필요할 수 있습니다.")\n    elif state == "CONFLICT":\n        st.error("식별 정보 충돌 — 사진 그룹 또는 라벨을 확인하세요. 자동 적용할 수 없습니다.")\n    else:\n        st.warning("미확정 — 아래 후보와 원본을 비교한 뒤 선택하세요.")\n    for item in result.get("conflicts", []):\n        st.error(item)\n    with st.expander("OCR 원문과 제품 조회 근거"):\n        st.code("\\n".join(o["text"] for o in result.get("observations", []) if o.get("pass_id") == "full"))\n        st.json({"fields": result.get("fields", {}), "lookups": result.get("lookup_events", []),\n                 "warnings": result.get("warnings", []), "runtime": result.get("runtime", {})})\n    packages = result.get("fields", {}).get("package", [])\n    if packages:\n        st.caption("판독한 포장 표기: " + " / ".join(dict.fromkeys(x["value"] for x in packages)) + " · Remaining amount은 Manual entry하세요.")\n\n\ndef render_candidate(env, result, candidate):\n    if not is_v8(result):\n        return\n    st = env["st"]\n    st.write("적용할 이름: **" + str(candidate.get("name", "")) + "**")\n    st.write("CAS: " + str(candidate.get("cas", "")) + " · Catalog: " + str(candidate.get("catalog", "")))\n    if candidate.get("source_url"):\n        st.markdown("[제품/물질 출처 확인](" + candidate["source_url"] + ")")\n    if not candidate.get("product_verified"):\n        st.checkbox("원본 라벨과 후보의 이름·CAS·제품번호를 대조했습니다.", key=review_key(result, candidate))\n\n\ndef _post(env, path, payload):\n    response = env["requests"].post(env["get_ocr_api_url"]().rstrip("/") + path,\n        headers={"X-API-Key": env["get_ocr_api_key"]()}, json=payload, timeout=60)\n    if response.status_code != 200:\n        raise ValueError("OCR API " + str(response.status_code) + ": " + response.text[:250])\n    return response.json()\n\n\ndef apply_result(env, result, original_bytes, filename, selected_candidate=None, source_scan_id=None, evidence_photos=None):\n    st = env["st"]\n    if not is_v8(result):\n        st.error("This OCR result is from an older version. Analyze again or use manual entry.")\n        st.stop()\n    selected = selected_candidate or result.get("verified_identity")\n    if not selected:\n        st.warning("Select a product or chemical candidate first, or use manual entry.")\n        st.stop()\n    try:\n        draft = _post(env, "/draft", {"review_token": result.get("review_token"),\n            "candidate_id": selected.get("candidate_id"),\n            "reviewed": bool(st.session_state.get(review_key(result, selected), False))})\n    except Exception as exc:\n        st.error(str(exc))\n        st.stop()  # Prevent the old caller from displaying its success banner/rerun.\n    fields = draft["fields"]\n    codes = {str(x.get("value", "")).strip().upper() for x in result.get("fields", {}).get("catalog", [])}\n    if fields.get("catalog") and codes and str(fields["catalog"]).upper() not in codes and not draft.get("catalog_correction"):\n        st.error("Catalog mismatch. The selected product differs from the label; please rescan.")\n        st.stop()\n    for key, field in (("add_name", "name"), ("add_cas", "cas"), ("add_formula", "formula"),\n                       ("add_mw", "mw"), ("add_manufacturer", "manufacturer"), ("add_catalog", "catalog")):\n        value = fields.get(field)\n        st.session_state[key] = "" if value is None else str(value)\n    for key in ("add_lot", "add_purity", "add_description"):\n        st.session_state[key] = ""\n    # Clear a previous bottle\'s amount; no package quantity is inferred as remaining stock.\n    st.session_state["add_initial_amount"] = 0.0\n    st.session_state["add_remaining_amount"] = 0.0\n    st.session_state["add_unit"] = "g"\n    quantity = draft.get("quantity") or {}\n    if quantity.get("unit") in ("g", "mg", "kg", "mL", "L") and isinstance(quantity.get("amount"), (int, float)) and quantity["amount"] > 0:\n        st.session_state["add_initial_amount"] = float(quantity["amount"])\n        st.session_state["add_unit"] = quantity["unit"]\n    st.session_state["add_manufacturer_widget_needs_sync"] = True\n    st.session_state["add_ocr_result"] = result\n    st.session_state["add_ocr_original"] = original_bytes\n    st.session_state["add_ocr_filename"] = filename\n    st.session_state["icl_v8_registration_draft"] = draft\n    if evidence_photos is not None:\n        st.session_state["add_ocr_group_photos"] = evidence_photos\n    if source_scan_id:\n        st.session_state["add_source_scan_id"] = source_scan_id\n    st.session_state["_pending_navigation"] = "Add Chemical"\n    return draft\n\n\ndef merge_group(env, records, group_id):\n    successful = [r for r in records if not r.get("error") and r.get("result")]\n    base = {"group_id": group_id, "records": records, "result": {}, "error": "", "conflicts": []}\n    if not successful or not all(is_v8(r["result"]) for r in successful):\n        return {**base, "error": "Analyze this photo group again with the current OCR API."}\n    unique = {r["result"]["scan_id"]: r for r in successful}\n    if len(unique) == 1:\n        return {**base, "result": next(iter(unique.values()))["result"], "conflicts": successful[0]["result"].get("conflicts", [])}\n    tokens = sorted(r["result"]["evidence_token"] for r in unique.values())\n    signature = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()\n    cache = env["st"].session_state.setdefault("icl_v8_group_cache", {})\n    try:\n        if signature not in cache:\n            # Errors are deliberately not cached. A subsequent rerun can retry 503s.\n            result = _post(env, "/resolve-group", {"evidence_tokens": tokens})\n            if not result.get("ok"):\n                raise ValueError("Group resolution failed")\n            cache[signature] = result\n        result = dict(cache[signature])\n        result["label_crop_base64"] = successful[0]["result"].get("label_crop_base64", "")\n        return {**base, "result": result, "conflicts": result.get("conflicts", [])}\n    except Exception as exc:\n        return {**base, "error": str(exc)}\n\n\ndef transform_source(source):\n    """Targeted source-span patches preserve unrelated UI and database code.\n\n    Run on the final UI-transformed source, including all fallback compile paths.\n    Unsupported source is an error, never a silently partial safety patch.\n    """\n    if "# ICL_V8_GUARD_APPLIED" in source:\n        return source\n    tree = ast.parse(source)\n    lines = source.splitlines(keepends=True)\n    offsets = [0]\n    for line in lines:\n        offsets.append(offsets[-1] + len(line))\n    def offset(lineno, byte_column):\n        # AST columns are UTF-8 byte offsets; Python string indices are characters.\n        return offsets[lineno - 1] + len(lines[lineno - 1].encode()[:byte_column].decode())\n    edits, found = [], set()\n    def replace(node, text):\n        edits.append((offset(node.lineno, node.col_offset), offset(node.end_lineno, node.end_col_offset), text))\n    helper = \'__import__("icl_ocr_ui_guard")\'\n    bodies = {\n        "ocr_candidate_label": f"return {helper}.candidate_label(candidate)",\n        "resolve_current_bottle_metadata": f"return {helper}.metadata(result)",\n        "merge_add_ocr_group": f"return {helper}.merge_group(globals(), records, group_id)",\n        "load_add_form_from_ocr": f"return {helper}.apply_result(globals(), result, original_bytes, filename, selected_candidate, source_scan_id, evidence_photos)",\n        "load_add_form_from_existing_bottle": f"return {helper}.apply_result(globals(), result, original_bytes, filename, source_scan_id=source_scan_id)",\n    }\n    replaced_regions = []\n    for node in tree.body:\n        if isinstance(node, ast.FunctionDef) and node.name in bodies:\n            found.add(node.name)\n            replace(node, "def " + node.name + "(" + ast.unparse(node.args) + "):\\n    " + bodies[node.name])\n            replaced_regions.append((node.lineno, node.end_lineno))\n    missing = set(bodies) - found\n    if missing:\n        raise ValueError("Unsupported Streamlit source; missing functions: " + ", ".join(sorted(missing)))\n    for node in ast.walk(tree):\n        if not hasattr(node, "lineno") or any(a <= node.lineno <= b for a, b in replaced_regions):\n            continue\n        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "add_candidates" for t in node.targets):\n            indent = " " * node.col_offset\n            replace(node, f"add_candidates = {helper}.candidates(add_ocr_result)\\n{indent}{helper}.render_review(globals(), add_ocr_result)")\n        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "chosen_candidate":\n            first = node.body[0]\n            start = offset(first.lineno, first.col_offset)\n            edits.append((start, start, f"{helper}.render_candidate(globals(), add_ocr_result, chosen_candidate)\\n" + " " * first.col_offset))\n        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "st":\n            if node.func.attr == "radio" and any(k.arg == "key" and isinstance(k.value, ast.Constant) and k.value.value == "add_chemical_candidate_choice" for k in node.keywords):\n                for k in node.keywords:\n                    if k.arg == "index":\n                        replace(k.value, "None")\n                    elif k.arg == "key":\n                        replace(k.value, f"{helper}.choice_key(add_ocr_result)")\n            if node.func.attr == "success" and node.args and isinstance(node.args[0], ast.Constant) and str(node.args[0].value) in ("Label fields verified", "Core label fields verified"):\n                replace(node, \'st.caption("필드 표시 완료 · 제품/물질 검증 상태는 아래에서 확인하세요.")\')\n    for start, end, text in sorted(edits, reverse=True):\n        source = source[:start] + text + source[end:]\n    source += "\\n# ICL_V8_GUARD_APPLIED\\n"\n    compile(source, "<ICL v8 guarded source>", "exec")\n    return source\n', _icl_guard.__file__, "exec"), _icl_guard.__dict__)
 _icl_sys.modules["icl_ocr_ui_guard"] = _icl_guard
 
 import json
@@ -48,10 +48,11 @@ st.set_page_config(
 def _icl_exception_message(exc):
     message = str(exc).strip()
     if not message:
-        message = "오류 상세 메시지가 없습니다. 오류 종류와 함께 이 화면을 알려주세요."
+        message = "No error details were returned. Share this screen with the error type."
     return type(exc).__name__ + ": " + message
 
 
+st.caption("ICL V8.3 · reviewed lookup corrections")
 st.markdown("""
 <style>
 
@@ -428,945 +429,10 @@ footer {
 """, unsafe_allow_html=True)
 
 st.markdown(
-    '''<style>
-:root {
-  --icl-navy:#01194C;
-  --icl-navy-hover:#0A2A64;
-  --icl-accent:#2F5FB7;
-  --icl-ink:#172033;
-  --icl-muted:#667085;
-  --icl-faint:#8B95A5;
-  --icl-canvas:#F7F8FA;
-  --icl-surface:#FFFFFF;
-  --icl-surface-muted:#F4F6F8;
-  --icl-border:#E1E6EE;
-  --icl-border-strong:#CBD4E1;
-  --icl-focus:#2F5FB7;
-  --icl-space-1:4px;
-  --icl-space-2:8px;
-  --icl-space-3:12px;
-  --icl-space-4:16px;
-  --icl-space-5:24px;
-  --icl-space-6:32px;
-  --icl-radius-sm:5px;
-  --icl-radius-md:8px;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Page frame                                                                 */
-/* -------------------------------------------------------------------------- */
-.stApp {
-  background:var(--icl-surface)!important;
-  color:var(--icl-ink)!important;
-}
-
-.block-container {
-  max-width:820px!important;
-  padding-block-start:1rem!important;
-  padding-block-end:2.5rem!important;
-  padding-inline:1rem!important;
-}
-
-[data-testid="stHeader"] {
-  background:transparent!important;
-}
-
-.stApp,
-.stApp p,
-.stApp li,
-.stApp label,
-.stApp input,
-.stApp textarea,
-.stApp button,
-.stApp [data-baseweb="select"] {
-  font-size:17px!important;
-}
-
-h1,h2,h3,h4 {
-  color:var(--icl-navy)!important;
-  letter-spacing:-.025em!important;
-  text-wrap:balance;
-}
-h1 { font-size:32px!important; line-height:1.12!important; }
-h2 { font-size:26px!important; line-height:1.18!important; }
-h3 { font-size:21px!important; line-height:1.22!important; }
-h4 { font-size:18px!important; line-height:1.28!important; }
-
-[data-testid="stCaptionContainer"],
-.stCaption,
-small {
-  color:var(--icl-muted)!important;
-  line-height:1.45!important;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Sidebar — preserve the original ICL white-rail character                  */
-/* -------------------------------------------------------------------------- */
-[data-testid="stSidebar"] {
-  min-width:270px!important;
-  background:var(--icl-surface)!important;
-  border-inline-end:1px solid var(--icl-border)!important;
-}
-
-[data-testid="stSidebar"] > div:first-child {
-  padding-block-start:.4rem!important;
-}
-
-[data-testid="stSidebar"] img {
-  display:block!important;
-  width:auto!important;
-  max-width:238px!important;
-  height:auto!important;
-  max-height:84px!important;
-  object-fit:contain!important;
-  margin:.05rem auto .08rem auto!important;
-}
-
-.icl-sidebar-product {
-  margin:.16rem .1rem .55rem .1rem;
-  color:var(--icl-faint);
-  font-size:13px!important;
-  font-weight:800;
-  letter-spacing:.14em;
-}
-
-[data-testid="stSidebar"] [role="radiogroup"] {
-  gap:2px!important;
-}
-
-[data-testid="stSidebar"] [role="radiogroup"] label,
-[data-testid="stSidebar"] .stButton > button {
-  min-height:42px!important;
-  width:100%!important;
-  justify-content:flex-start!important;
-  text-align:start!important;
-  margin:0!important;
-  padding:.48rem .68rem!important;
-  border:0!important;
-  border-inline-start:3px solid transparent!important;
-  border-radius:0!important;
-  background:transparent!important;
-  box-shadow:none!important;
-  color:#252C37!important;
-  font-size:17px!important;
-  font-weight:620!important;
-  letter-spacing:.01em!important;
-  transition:none!important;
-}
-
-[data-testid="stSidebar"] [role="radiogroup"] label:hover,
-[data-testid="stSidebar"] .stButton > button:hover {
-  background:#F4F6F8!important;
-  color:var(--icl-navy)!important;
-}
-
-[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked),
-[data-testid="stSidebar"] .stButton > button[kind="primary"] {
-  background:#F1F4F8!important;
-  border-inline-start-color:var(--icl-navy)!important;
-  color:var(--icl-navy)!important;
-  font-weight:700!important;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Shared workspace headers                                                   */
-/* -------------------------------------------------------------------------- */
-.icl-shell-header,
-.icl-add-hero {
-  width:100%!important;
-  max-width:100%!important;
-  box-sizing:border-box!important;
-  margin:.1rem 0 1rem 0!important;
-  border-radius:var(--icl-radius-md)!important;
-  box-shadow:none!important;
-}
-
-.icl-shell-header {
-  position:relative;
-  display:flex!important;
-  align-items:center!important;
-  justify-content:space-between!important;
-  gap:var(--icl-space-4)!important;
-  min-height:72px;
-  overflow:hidden;
-  padding:13px 16px 13px 20px!important;
-  background:var(--icl-surface)!important;
-  border:1px solid var(--icl-border)!important;
-}
-
-.icl-shell-header::before {
-  content:"";
-  position:absolute;
-  inset-block:0;
-  inset-inline-start:0;
-  width:4px;
-  background:var(--icl-navy);
-}
-
-.icl-shell-copy {
-  min-width:0;
-}
-
-.icl-shell-eyebrow,
-.icl-add-kicker {
-  margin:0 0 2px 0!important;
-  font-size:12.5px!important;
-  font-weight:800!important;
-  letter-spacing:.13em!important;
-  text-transform:uppercase;
-}
-
-.icl-shell-eyebrow {
-  color:var(--icl-faint)!important;
-}
-
-.icl-shell-title,
-.icl-add-title {
-  margin:0!important;
-  font-size:27px!important;
-  font-weight:780!important;
-  letter-spacing:-.035em!important;
-  line-height:1.05!important;
-}
-
-.icl-shell-title {
-  color:var(--icl-navy)!important;
-}
-
-.icl-shell-pills,
-.icl-add-steps {
-  display:flex;
-  flex-wrap:wrap;
-  align-items:center;
-  justify-content:flex-end;
-  gap:4px;
-}
-
-.icl-shell-pills span {
-  display:inline-flex;
-  align-items:center;
-  min-height:24px;
-  padding:.18rem .46rem;
-  border:1px solid #DCE3EC;
-  border-radius:999px;
-  background:#F7F9FB;
-  color:#536071;
-  font-size:13.5px!important;
-  font-weight:700;
-  white-space:nowrap;
-}
-
-/* Add Chemical remains the visually distinct task surface, but uses the same
-   geometry and alignment grid as the rest of the manager. */
-.icl-add-hero {
-  display:flex!important;
-  align-items:center!important;
-  justify-content:space-between!important;
-  gap:var(--icl-space-4)!important;
-  min-height:72px;
-  padding:13px 16px 13px 20px!important;
-  background:var(--icl-navy)!important;
-  border:1px solid var(--icl-navy)!important;
-  color:#fff!important;
-}
-
-.icl-add-kicker {
-  color:#C7D2E8!important;
-}
-
-.icl-add-title {
-  color:#fff!important;
-}
-
-.icl-add-steps {
-  gap:6px!important;
-}
-
-.icl-add-steps span {
-  display:inline-flex;
-  align-items:center;
-  gap:.28rem;
-  min-height:27px;
-  padding:.26rem .5rem;
-  border:1px solid rgba(255,255,255,.25);
-  border-radius:999px;
-  background:rgba(255,255,255,.08);
-  color:#fff;
-  font-size:13.5px!important;
-  font-weight:650;
-  white-space:nowrap;
-}
-
-.icl-add-steps b {
-  color:#C9D8FF;
-  font-size:12px!important;
-  letter-spacing:.04em;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Controls — one clear hierarchy                                             */
-/* -------------------------------------------------------------------------- */
-.stTextInput input,
-.stNumberInput input,
-.stDateInput input,
-.stTextArea textarea,
-[data-baseweb="select"] > div {
-  min-height:44px!important;
-  border:1px solid transparent!important;
-  border-radius:6px!important;
-  background:var(--icl-surface-muted)!important;
-  box-shadow:inset 0 0 0 1px #DCE2EA!important;
-}
-
-.stTextArea textarea {
-  min-height:96px!important;
-}
-
-.stTextInput input:focus,
-.stNumberInput input:focus,
-.stDateInput input:focus,
-.stTextArea textarea:focus,
-[data-baseweb="select"]:focus-within > div {
-  border-color:transparent!important;
-  box-shadow:inset 0 0 0 1px var(--icl-focus),0 0 0 3px rgba(47,95,183,.14)!important;
-}
-
-[data-testid="stWidgetLabel"] p {
-  margin-block-end:3px!important;
-  color:#3F4856!important;
-  font-size:15.5px!important;
-  font-weight:680!important;
-}
-
-main .stButton > button,
-main .stDownloadButton > button,
-main [data-testid="stFormSubmitButton"] > button,
-main [data-testid="stLinkButton"] a {
-  min-height:46px!important;
-  padding:.58rem .95rem!important;
-  border:1px solid var(--icl-border-strong)!important;
-  border-radius:6px!important;
-  background:#fff!important;
-  box-shadow:none!important;
-  color:var(--icl-navy)!important;
-  font-size:17px!important;
-  font-weight:700!important;
-  line-height:1.2!important;
-}
-
-main .stButton > button:hover,
-main .stDownloadButton > button:hover,
-main [data-testid="stLinkButton"] a:hover {
-  border-color:#9BAAC0!important;
-  background:#F7F9FB!important;
-}
-
-main button[kind="primary"],
-main button[kind="primary"] *,
-main [data-testid="stFormSubmitButton"] button[kind="primary"],
-main [data-testid="stFormSubmitButton"] button[kind="primary"] * {
-  background:var(--icl-navy)!important;
-  border-color:var(--icl-navy)!important;
-  color:#fff!important;
-  -webkit-text-fill-color:#fff!important;
-}
-
-main button[kind="primary"]:hover,
-main button[kind="primary"]:hover * {
-  background:var(--icl-navy-hover)!important;
-  border-color:var(--icl-navy-hover)!important;
-  color:#fff!important;
-  -webkit-text-fill-color:#fff!important;
-}
-
-main button:disabled,
-main button:disabled * {
-  opacity:1!important;
-  background:#EEF1F5!important;
-  border-color:#E1E6ED!important;
-  color:#8993A2!important;
-  -webkit-text-fill-color:#8993A2!important;
-}
-
-main button:focus-visible,
-[data-testid="stSidebar"] button:focus-visible,
-main a:focus-visible,
-[data-baseweb="select"]:focus-within {
-  outline:2px solid var(--icl-focus)!important;
-  outline-offset:2px!important;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Grouping and progressive disclosure                                        */
-/* -------------------------------------------------------------------------- */
-[data-testid="stForm"],
-[data-testid="stExpander"],
-[data-testid="stMetric"],
-[data-testid="stDataFrame"] {
-  border-color:var(--icl-border)!important;
-  box-shadow:none!important;
-}
-
-[data-testid="stForm"] {
-  border-radius:var(--icl-radius-md)!important;
-  background:#fff!important;
-}
-
-[data-testid="stExpander"] {
-  border-radius:6px!important;
-  background:#FAFBFC!important;
-}
-
-[data-testid="stExpander"] summary {
-  min-height:42px!important;
-  font-weight:680!important;
-}
-
-[data-testid="stMetric"] {
-  border-radius:6px!important;
-  background:#fff!important;
-}
-
-[data-testid="stMetricValue"],
-input[type="number"],
-[data-testid="stDataFrame"] {
-  font-variant-numeric:tabular-nums;
-}
-
-[data-testid="stAlert"] {
-  border-radius:6px!important;
-  box-shadow:none!important;
-}
-
-.icl-result-line {
-  margin:var(--icl-space-2) 0 var(--icl-space-4) 0;
-  padding:var(--icl-space-3) var(--icl-space-4);
-  border:0;
-  border-inline-start:4px solid var(--icl-navy);
-  border-radius:3px;
-  background:#F7F9FB;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Upload, camera and label-review surfaces                                   */
-/* -------------------------------------------------------------------------- */
-[data-testid="stFileUploaderDropzone"] {
-  min-height:124px!important;
-  padding:1.25rem 1.1rem!important;
-  display:flex!important;
-  align-items:center!important;
-  border:1.5px dashed #94A3B8!important;
-  border-radius:8px!important;
-  background:#FBFCFD!important;
-}
-
-[data-testid="stFileUploaderDropzone"] > div {
-  width:100%!important;
-}
-
-[data-testid="stFileUploaderDropzone"] p,
-[data-testid="stFileUploaderDropzone"] span,
-[data-testid="stFileUploaderDropzone"] small {
-  font-size:16px!important;
-  line-height:1.45!important;
-}
-
-[data-testid="stFileUploaderDropzone"] button {
-  min-height:46px!important;
-  padding:.56rem .9rem!important;
-  font-size:17px!important;
-  font-weight:700!important;
-}
-
-[data-testid="stCameraInput"] {
-  padding:.42rem!important;
-  border:1px solid var(--icl-border)!important;
-  border-radius:8px!important;
-  background:#fff!important;
-}
-
-[data-testid="stCameraInput"] button {
-  min-height:48px!important;
-  font-size:17px!important;
-  font-weight:720!important;
-}
-
-main [data-testid="stImage"] img {
-  height:auto!important;
-  max-width:100%!important;
-  border:1px solid #E3E8EF;
-  border-radius:6px;
-  background:#fff;
-}
-
-[data-baseweb="tab-list"] {
-  gap:var(--icl-space-2)!important;
-}
-
-[data-baseweb="tab"] {
-  min-height:44px!important;
-  font-weight:700!important;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Inventory / scan / dialogs                                                 */
-/* -------------------------------------------------------------------------- */
-.icl-scan-hero {
-  margin:.1rem 0 var(--icl-space-4) 0;
-  padding:var(--icl-space-4) var(--icl-space-5);
-  border:1px solid var(--icl-border);
-  border-inline-start:4px solid var(--icl-navy);
-  border-radius:var(--icl-radius-md);
-  background:#fff;
-}
-
-.icl-scan-kicker {
-  color:var(--icl-accent);
-  font-size:12.5px!important;
-  font-weight:800;
-  letter-spacing:.13em;
-  text-transform:uppercase;
-}
-
-.icl-scan-title {
-  margin-block-start:2px;
-  color:var(--icl-navy);
-  font-size:25px!important;
-  font-weight:760;
-  letter-spacing:-.025em;
-}
-
-.icl-scan-flow,
-.icl-scan-note-row {
-  display:flex;
-  flex-wrap:wrap;
-  align-items:center;
-}
-
-.icl-scan-flow {
-  gap:var(--icl-space-2);
-  margin:.55rem 0 .45rem 0;
-}
-
-.icl-scan-flow span,
-.icl-scan-note-row span {
-  display:inline-flex;
-  align-items:center;
-  border-radius:999px;
-  white-space:nowrap;
-}
-
-.icl-scan-flow span {
-  gap:.32rem;
-  padding:.28rem .55rem;
-  border:1px solid #DCE3EC;
-  background:#fff;
-  color:#344054;
-  font-size:14.5px!important;
-  font-weight:650;
-}
-
-.icl-scan-flow span b {
-  display:inline-grid;
-  width:1.25rem;
-  height:1.25rem;
-  place-items:center;
-  border-radius:50%;
-  background:var(--icl-navy);
-  color:#fff;
-  font-size:12.5px!important;
-}
-
-.icl-scan-flow i {
-  color:#98A2B3;
-  font-style:normal;
-}
-
-.icl-scan-note-row {
-  gap:6px;
-}
-
-.icl-scan-note-row span {
-  min-height:24px;
-  padding:.2rem .48rem;
-  background:#F2F4F7;
-  color:#667085;
-  font-size:13px!important;
-  font-weight:650;
-}
-
-[data-testid="stDataFrame"] {
-  width:100%!important;
-  max-width:100%!important;
-  overflow-x:auto!important;
-  border-radius:6px!important;
-}
-
-[data-testid="stDialog"] [role="dialog"] {
-  border:1px solid #DCE2EA!important;
-  border-radius:8px!important;
-  box-shadow:0 22px 72px rgba(1,25,76,.16)!important;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Responsive + resilience                                                    */
-/* -------------------------------------------------------------------------- */
-@media (max-width:800px) {
-  [data-testid="stSidebar"] {
-    min-width:unset!important;
-  }
-
-  .block-container {
-    max-width:100%!important;
-    padding-block-start:.65rem!important;
-    padding-inline:max(.75rem,env(safe-area-inset-left))!important;
-  }
-
-  .icl-shell-header,
-  .icl-add-hero {
-    min-height:unset!important;
-    align-items:flex-start!important;
-    flex-direction:column!important;
-    padding:12px 14px 12px 18px!important;
-    gap:10px!important;
-  }
-
-  .icl-shell-title,
-  .icl-add-title {
-    font-size:24px!important;
-  }
-
-  .icl-shell-pills {
-    display:none!important;
-  }
-
-  .icl-add-steps {
-    justify-content:flex-start!important;
-    gap:5px!important;
-  }
-
-  .icl-add-steps span {
-    font-size:13px!important;
-  }
-
-  h1 { font-size:28px!important; }
-  h2 { font-size:23px!important; }
-  h3 { font-size:19px!important; }
-
-  [data-testid="stFileUploaderDropzone"] {
-    min-height:112px!important;
-    padding:1rem .85rem!important;
-  }
-
-  [data-testid="stCameraInput"] {
-    padding:.25rem!important;
-  }
-
-  [data-testid="stCameraInput"] button,
-  main .stButton > button,
-  main .stDownloadButton > button,
-  main [data-testid="stFormSubmitButton"] > button {
-    min-height:46px!important;
-    font-size:16.5px!important;
-  }
-
-  .icl-scan-hero {
-    padding:14px 16px;
-  }
-
-  .icl-scan-title {
-    font-size:22px!important;
-  }
-
-  .icl-scan-flow i {
-    display:none;
-  }
-
-  [data-testid="stDataFrame"] {
-    min-height:280px;
-  }
-
-  [data-testid="stDialog"] [role="dialog"] {
-    width:calc(100vw - 1rem)!important;
-    max-width:calc(100vw - 1rem)!important;
-    margin:.5rem!important;
-  }
-}
-
-@media (prefers-reduced-motion:reduce) {
-  *,*::before,*::after {
-    scroll-behavior:auto!important;
-    animation-duration:.01ms!important;
-    animation-iteration-count:1!important;
-    transition-duration:.01ms!important;
-  }
-}
-
-
-/* ICL sidebar v2 — compact navigation rail */
-[data-testid="stSidebar"] {
-  border-inline-end:1px solid #E5E9F0!important;
-}
-
-[data-testid="stSidebarUserContent"] {
-  padding:14px 16px 18px 16px!important;
-}
-
-[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-  gap:.28rem!important;
-}
-
-[data-testid="stSidebar"] img {
-  max-width:190px!important;
-  max-height:66px!important;
-  margin:0 auto .18rem auto!important;
-}
-
-.icl-sidebar-product {
-  margin:.12rem 0 .45rem 0!important;
-  padding-bottom:.52rem!important;
-  border-bottom:1px solid #E8ECF2;
-  font-size:11.5px!important;
-  letter-spacing:.16em!important;
-}
-
-[data-testid="stSidebar"] hr {
-  margin:.48rem 0!important;
-  border-color:#E8ECF2!important;
-}
-
-[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
-  font-size:12.5px!important;
-  line-height:1.3!important;
-  color:#8A94A3!important;
-}
-
-[data-testid="stSidebar"] .stMarkdown p,
-[data-testid="stSidebar"] .stMarkdown a {
-  line-height:1.35!important;
-}
-
-[data-testid="stSidebar"] .stButton {
-  margin:0!important;
-}
-
-[data-testid="stSidebar"] .stButton > button {
-  min-height:36px!important;
-  padding:.34rem .5rem!important;
-  border:0!important;
-  border-inline-start:2px solid transparent!important;
-  border-radius:4px!important;
-  background:transparent!important;
-  color:#303846!important;
-  box-shadow:none!important;
-  font-size:15.5px!important;
-  font-weight:590!important;
-  letter-spacing:0!important;
-}
-
-[data-testid="stSidebar"] .stButton > button p {
-  width:100%!important;
-  margin:0!important;
-  text-align:left!important;
-  font-size:15.5px!important;
-  line-height:1.2!important;
-}
-
-[data-testid="stSidebar"] .stButton > button:hover {
-  background:#F6F8FA!important;
-  color:var(--icl-navy)!important;
-}
-
-[data-testid="stSidebar"] .stButton > button[kind="primary"] {
-  background:transparent!important;
-  border-inline-start-color:var(--icl-navy)!important;
-  color:var(--icl-navy)!important;
-  font-weight:720!important;
-}
-
-[data-testid="stSidebar"] .stButton > button[kind="primary"] p {
-  color:var(--icl-navy)!important;
-  font-weight:720!important;
-}
-
-[data-testid="stSidebar"] button:focus-visible {
-  outline:2px solid var(--icl-focus)!important;
-  outline-offset:1px!important;
-}
-
-@media (max-width:800px) {
-  [data-testid="stSidebarUserContent"] {
-    padding:12px 14px 16px 14px!important;
-  }
-
-  [data-testid="stSidebar"] img {
-    max-width:176px!important;
-    max-height:61px!important;
-  }
-
-  [data-testid="stSidebar"] .stButton > button,
-  [data-testid="stSidebar"] .stButton > button p {
-    font-size:15px!important;
-  }
-}
-
-
-/* ICL sidebar v3 — account + nested navigation hierarchy */
-[data-testid="stSidebar"] hr {
-  margin:.72rem 0!important;
-  border:0!important;
-  border-top:1px solid #D2D9E4!important;
-  opacity:1!important;
-}
-
-.icl-account-label {
-  margin:0 0 .24rem 0;
-  color:#8A94A3;
-  font-size:11px!important;
-  font-weight:800;
-  letter-spacing:.15em;
-}
-
-[data-testid="stSidebar"] .st-key-icl_logout {
-  margin:.38rem 0 .05rem 0!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_logout button {
-  min-height:32px!important;
-  width:100%!important;
-  justify-content:center!important;
-  padding:.25rem .55rem!important;
-  border:1px solid #D5DCE6!important;
-  border-radius:5px!important;
-  background:#FFFFFF!important;
-  box-shadow:none!important;
-  color:#515B6A!important;
-  font-size:13.5px!important;
-  font-weight:650!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_logout button p {
-  width:auto!important;
-  text-align:center!important;
-  color:#515B6A!important;
-  font-size:13.5px!important;
-  font-weight:650!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_logout button:hover {
-  border-color:#9CA9BC!important;
-  background:#F8FAFC!important;
-  color:var(--icl-navy)!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_root_inventory button[kind="primary"],
-[data-testid="stSidebar"] .st-key-icl_nav_root_excel button[kind="primary"] {
-  background:transparent!important;
-  border-inline-start-color:transparent!important;
-  color:var(--icl-navy)!important;
-  font-weight:730!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_root_inventory button[kind="primary"] p,
-[data-testid="stSidebar"] .st-key-icl_nav_root_excel button[kind="primary"] p {
-  color:var(--icl-navy)!important;
-  font-weight:730!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_root_inventory button[kind="primary"] p::after,
-[data-testid="stSidebar"] .st-key-icl_nav_root_excel button[kind="primary"] p::after {
-  content:"⌄";
-  float:right;
-  margin-left:.5rem;
-  color:#8C97A7;
-  font-size:12px;
-  font-weight:700;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals,
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_scan,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_import,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_export {
-  width:calc(100% - 18px)!important;
-  margin-left:18px!important;
-  padding-left:9px!important;
-  border-left:1px solid #D9E0E9!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals button,
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_scan button,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_import button,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_export button {
-  min-height:30px!important;
-  padding:.2rem .46rem!important;
-  border-inline-start:0!important;
-  border-radius:4px!important;
-  background:transparent!important;
-  color:#667085!important;
-  font-size:14.25px!important;
-  font-weight:560!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals button p,
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_scan button p,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_import button p,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_export button p {
-  color:inherit!important;
-  font-size:14.25px!important;
-  font-weight:inherit!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals button:hover,
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_scan button:hover,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_import button:hover,
-[data-testid="stSidebar"] .st-key-icl_nav_excel_export button:hover {
-  background:#F7F9FB!important;
-  color:var(--icl-navy)!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals button[kind="primary"],
-[data-testid="stSidebar"] .st-key-icl_nav_inventory_scan button[kind="primary"],
-[data-testid="stSidebar"] .st-key-icl_nav_excel_import button[kind="primary"],
-[data-testid="stSidebar"] .st-key-icl_nav_excel_export button[kind="primary"] {
-  background:#F1F4F8!important;
-  color:var(--icl-navy)!important;
-  font-weight:720!important;
-}
-
-@media (max-width:800px) {
-  [data-testid="stSidebar"] .st-key-icl_nav_inventory_chemicals,
-  [data-testid="stSidebar"] .st-key-icl_nav_inventory_scan,
-  [data-testid="stSidebar"] .st-key-icl_nav_excel_import,
-  [data-testid="stSidebar"] .st-key-icl_nav_excel_export {
-    width:calc(100% - 16px)!important;
-    margin-left:16px!important;
-    padding-left:8px!important;
-  }
-}
-
-/* ICL sidebar v4 — signed-in block spacing */
-.icl-account-label {
-  display:block!important;
-  min-height:18px!important;
-  margin:0!important;
-  padding:0 0 7px 0!important;
-  line-height:1.35!important;
-}
-
-[data-testid="stSidebar"] .stMarkdown:has(.icl-account-label),
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(.icl-account-label) {
-  min-height:25px!important;
-  margin:0!important;
-  padding:0!important;
-}
-
-[data-testid="stSidebar"] .st-key-icl_logout {
-  margin:.62rem 0 .10rem 0!important;
-}
-
-</style>''',
+    '<style>:root {\n  --icl-navy:#01194C;\n  --icl-navy-2:#0A2A64;\n  --icl-blue:#2F5FB7;\n  --icl-bg:#F7F8FB;\n  --icl-border:#E1E6EF;\n  --icl-text:#172033;\n  --icl-muted:#6D7480;\n}\n\n.stApp {\n  background:linear-gradient(180deg,#fff 0,#fff 116px,var(--icl-bg) 116px)!important;\n  color:var(--icl-text);\n}\n\n.block-container {\n  max-width:1220px!important;\n  padding-top:1.05rem!important;\n  padding-bottom:2.2rem!important;\n}\n\n[data-testid="stHeader"] { background:transparent!important; }\n\n/* Original lab website character: white left rail + typography-first navigation. */\n[data-testid="stSidebar"] {\n  min-width:270px!important;\n  background:#fff!important;\n  border-right:1px solid #E7EAF0!important;\n}\n[data-testid="stSidebar"] > div:first-child {\n  padding-top:.4rem!important;\n}\n[data-testid="stSidebar"] img {\n  display:block!important;\n  width:auto!important;\n  max-width:238px!important;\n  height:auto!important;\n  max-height:84px!important;\n  object-fit:contain!important;\n  margin:.05rem auto .08rem auto!important;\n}\n.icl-sidebar-product {\n  color:#8A92A0;\n  font-size:13px;\n  font-weight:800;\n  letter-spacing:.15em;\n  margin:.16rem .1rem .5rem .1rem;\n}\n\n/* Legacy radio navigation, retained for any untouched page fragments. */\n[data-testid="stSidebar"] [role="radiogroup"] { gap:.16rem!important; }\n[data-testid="stSidebar"] [role="radiogroup"] label {\n  border-radius:0!important;\n  padding:.48rem .62rem!important;\n  font-weight:600!important;\n  letter-spacing:.025em!important;\n  color:#222833!important;\n  border-left:3px solid transparent!important;\n  transition:background .12s ease,border-color .12s ease,color .12s ease;\n}\n[data-testid="stSidebar"] [role="radiogroup"] label:hover {\n  background:#F4F6FA!important;\n  color:var(--icl-navy)!important;\n}\n[data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {\n  background:#F2F5FA!important;\n  border-left-color:var(--icl-navy)!important;\n  color:var(--icl-navy)!important;\n}\n\n/* UX v3 hierarchical navigation. */\n[data-testid="stSidebar"] .stButton > button {\n  justify-content:flex-start!important;\n  text-align:left!important;\n  width:100%!important;\n  min-height:39px!important;\n  padding:.44rem .62rem!important;\n  margin:0!important;\n  border:0!important;\n  border-left:3px solid transparent!important;\n  border-radius:0!important;\n  background:transparent!important;\n  color:#222833!important;\n  box-shadow:none!important;\n  font-size:17px!important;\n  font-weight:600!important;\n  letter-spacing:.018em!important;\n}\n[data-testid="stSidebar"] .stButton > button:hover {\n  background:#F4F6FA!important;\n  color:var(--icl-navy)!important;\n}\n[data-testid="stSidebar"] .stButton > button[kind="primary"] {\n  background:#F2F5FA!important;\n  color:var(--icl-navy)!important;\n  border-left-color:var(--icl-navy)!important;\n}\n\n/* Compact ICL workspace header: content-sized instead of full-width billboard. */\n.icl-shell-header {\n  position:relative;\n  display:inline-flex;\n  width:auto;\n  max-width:100%;\n  align-items:center;\n  justify-content:flex-start;\n  gap:.72rem;\n  overflow:hidden;\n  background:#fff;\n  border:1px solid var(--icl-border);\n  border-radius:4px;\n  padding:.58rem .72rem .58rem 1rem;\n  margin-bottom:.72rem;\n}\n.icl-shell-header::before {\n  content:"";\n  position:absolute;\n  left:0;top:0;bottom:0;width:4px;\n  background:var(--icl-navy);\n}\n.icl-shell-copy { min-width:0; }\n.icl-shell-eyebrow {\n  font-size:13px;\n  font-weight:800;\n  letter-spacing:.14em;\n  color:#7D8795;\n  margin-bottom:.12rem;\n  white-space:nowrap;\n  overflow:hidden;\n  text-overflow:ellipsis;\n}\n.icl-shell-title {\n  font-size:29.5px;\n  font-weight:780;\n  letter-spacing:-.035em;\n  color:var(--icl-navy);\n  line-height:1.02;\n}\n.icl-shell-pills {\n  display:flex;\n  flex-wrap:wrap;\n  justify-content:flex-start;\n  gap:.25rem;\n}\n.icl-shell-pills span {\n  display:inline-flex;\n  align-items:center;\n  min-height:24px;\n  padding:.18rem .44rem;\n  border:1px solid #DCE3EE;\n  background:#F7F9FC;\n  border-radius:999px;\n  color:#526070;\n  font-size:14px;\n  font-weight:700;\n  letter-spacing:.02em;\n}\n\nh1,h2,h3,h4 { color:var(--icl-navy)!important;letter-spacing:-.025em!important; }\nh1 { font-size:34px!important; }\nh2 { font-size:27px!important; }\nh3 { font-size:21px!important; }\n\n.stApp,.stApp p,.stApp li,.stApp label,.stApp input,.stApp textarea,\n.stApp button,.stApp [data-baseweb="select"] { font-size:17px!important; }\n\n.stTextInput input,.stNumberInput input,.stDateInput input,.stTextArea textarea,\n[data-baseweb="select"] > div {\n  border-color:#D7DDE8!important;\n  border-radius:6px!important;\n  background:#fff!important;\n}\n\n/* Main-canvas actions: readable at a glance when reviewing many bottles. */\nmain .stButton > button,\nmain .stDownloadButton > button,\nmain [data-testid="stFormSubmitButton"] > button,\nmain [data-testid="stLinkButton"] a {\n  border-radius:5px!important;\n  font-weight:680!important;\n  min-height:48px!important;\n  padding:.64rem 1.05rem!important;\n  font-size:18px!important;\n  line-height:1.2!important;\n}\n\n/* Primary button text must stay readable on ICL navy. */\nmain button[kind="primary"],\nmain button[kind="primary"] *,\nmain [data-testid="stFormSubmitButton"] button[kind="primary"],\nmain [data-testid="stFormSubmitButton"] button[kind="primary"] * {\n  background:var(--icl-navy)!important;\n  border-color:var(--icl-navy)!important;\n  color:#fff!important;\n  -webkit-text-fill-color:#fff!important;\n}\nmain button[kind="primary"]:hover,\nmain button[kind="primary"]:hover * {\n  background:var(--icl-navy-2)!important;\n  border-color:var(--icl-navy-2)!important;\n  color:#fff!important;\n  -webkit-text-fill-color:#fff!important;\n}\n\n/* Disabled actions should look disabled, not like dark unreadable active buttons. */\nmain button:disabled,\nmain button:disabled * {\n  opacity:1!important;\n  background:#E7ECF4!important;\n  border-color:#D7DFEA!important;\n  color:#7D8797!important;\n  -webkit-text-fill-color:#7D8797!important;\n}\n\n[data-testid="stForm"],[data-testid="stExpander"],[data-testid="stMetric"],[data-testid="stDataFrame"] {\n  border-color:var(--icl-border)!important;\n  border-radius:7px!important;\n  box-shadow:none!important;\n}\n[data-testid="stAlert"] { border-radius:6px!important; }\n\n/* Chemical/Search + Storage details open as modal dialogs. */\n[data-testid="stDialog"] [role="dialog"] {\n  border-radius:8px!important;\n  border:1px solid #DDE3ED!important;\n  box-shadow:0 24px 80px rgba(1,25,76,.18)!important;\n}\n\n/* Add Chemical is the intentionally redesigned workflow. */\n.icl-add-hero {\n  display:flex;\n  align-items:center;\n  justify-content:space-between;\n  gap:1rem;\n  background:var(--icl-navy);\n  color:#fff;\n  border-radius:9px;\n  padding:1.22rem 1.38rem;\n  margin:.1rem 0 1rem 0;\n}\n.icl-add-kicker { font-size:13px;font-weight:800;letter-spacing:.16em;opacity:.72; }\n.icl-add-title { font-size:29px;font-weight:780;letter-spacing:-.025em;margin-top:.12rem; }\n.icl-add-steps {\n  display:flex;\n  align-items:center;\n  flex-wrap:wrap;\n  justify-content:flex-end;\n  gap:.42rem;\n}\n.icl-add-steps span {\n  display:inline-flex;\n  align-items:center;\n  gap:.3rem;\n  padding:.38rem .58rem;\n  border:1px solid rgba(255,255,255,.24);\n  border-radius:999px;\n  background:rgba(255,255,255,.08);\n  font-size:14.5px;\n  font-weight:650;\n  white-space:nowrap;\n}\n.icl-add-steps b { color:#BFD0FF;font-size:12.7px;letter-spacing:.06em; }\n.icl-result-line {\n  border-left:4px solid var(--icl-navy);background:#fff;\n  border-top:1px solid var(--icl-border);border-right:1px solid var(--icl-border);\n  border-bottom:1px solid var(--icl-border);padding:.72rem .82rem;\n  border-radius:4px;margin:.25rem 0 .55rem 0;\n}\n\n/* Inventory Scan: compact workflow card instead of developer prose. */\n.icl-scan-hero {\n  background:#fff;\n  border:1px solid var(--icl-border);\n  border-left:6px solid var(--icl-navy);\n  border-radius:7px;\n  padding:1.05rem 1.15rem;\n  margin:.1rem 0 .75rem 0;\n}\n.icl-scan-kicker {\n  font-size:13px;\n  font-weight:800;\n  letter-spacing:.15em;\n  color:var(--icl-blue);\n}\n.icl-scan-title {\n  color:var(--icl-navy);\n  font-size:27px;\n  font-weight:760;\n  letter-spacing:-.025em;\n  margin-top:.15rem;\n}\n.icl-scan-flow {\n  display:flex;\n  align-items:center;\n  flex-wrap:wrap;\n  gap:.4rem;\n  margin:.42rem 0 .48rem 0;\n}\n.icl-scan-flow span {\n  display:inline-flex;\n  align-items:center;\n  gap:.35rem;\n  border:1px solid #DCE3EE;\n  border-radius:999px;\n  padding:.38rem .62rem;\n  background:#fff;\n  color:#334155;\n  font-size:15px;\n  font-weight:650;\n}\n.icl-scan-flow span b {\n  display:inline-grid;\n  place-items:center;\n  width:1.25rem;\n  height:1.25rem;\n  border-radius:50%;\n  background:var(--icl-navy);\n  color:#fff;\n  font-size:13.5px;\n}\n.icl-scan-flow i {\n  color:#94A3B8;\n  font-style:normal;\n}\n.icl-scan-note-row {\n  display:flex;\n  flex-wrap:wrap;\n  gap:.38rem;\n}\n.icl-scan-note-row span {\n  display:inline-flex;\n  align-items:center;\n  min-height:25px;\n  padding:.22rem .5rem;\n  border-radius:4px;\n  background:#F2F5FA;\n  color:#5B6574;\n  font-size:13.7px;\n  font-weight:650;\n}\n\n/* Bottle-photo uploader: taller hit target + larger, legible Upload button. */\n[data-testid="stFileUploaderDropzone"] {\n  min-height:132px!important;\n  padding:1.45rem 1.25rem!important;\n  display:flex!important;\n  align-items:center!important;\n  background:#fff!important;\n  border:1.5px dashed #92A3BD!important;\n  border-radius:9px!important;\n}\n[data-testid="stFileUploaderDropzone"] > div { width:100%!important; }\n[data-testid="stFileUploaderDropzone"] p,\n[data-testid="stFileUploaderDropzone"] span,\n[data-testid="stFileUploaderDropzone"] small {\n  font-size:16px!important;\n  line-height:1.45!important;\n}\n[data-testid="stFileUploaderDropzone"] button {\n  min-height:48px!important;\n  padding:.64rem 1.05rem!important;\n  font-size:18px!important;\n  font-weight:700!important;\n}\n\n/* Mobile camera capture should feel like the primary field workflow, not a debug widget. */\n[data-testid="stCameraInput"] {\n  border:1px solid var(--icl-border)!important;\n  border-radius:9px!important;\n  background:#fff!important;\n  padding:.45rem!important;\n}\n[data-testid="stCameraInput"] button {\n  min-height:52px!important;\n  font-size:18px!important;\n  font-weight:750!important;\n}\n[data-baseweb="tab-list"] {\n  gap:.3rem!important;\n}\n[data-baseweb="tab"] {\n  min-height:44px!important;\n  font-weight:700!important;\n}\n\n/* Responsive inventory table: scroll horizontally instead of collapsing. */\n[data-testid="stDataFrame"] {\n  width:100%!important;\n  max-width:100%!important;\n  overflow-x:auto!important;\n}\n\n@media (max-width:800px) {\n  [data-testid="stSidebar"] { min-width:unset!important; }\n  .block-container {\n    padding-left:.65rem!important;\n    padding-right:.65rem!important;\n    padding-top:.65rem!important;\n  }\n  .icl-shell-header,.icl-add-hero {\n    align-items:flex-start;\n    flex-direction:column;\n  }\n  .icl-shell-header {\n    padding:.62rem .68rem .62rem .92rem;\n    margin-bottom:.62rem;\n  }\n  .icl-shell-eyebrow { font-size:12px;letter-spacing:.12em; }\n  .icl-shell-title { font-size:24.5px; }\n  .icl-shell-pills,.icl-add-steps { justify-content:flex-start; }\n  h1 { font-size:27.5px!important; }\n  h2 { font-size:23.5px!important; }\n  h3 { font-size:19.5px!important; }\n  [data-testid="stFileUploaderDropzone"] {\n    min-height:116px!important;\n    padding:1rem .85rem!important;\n  }\n  [data-testid="stCameraInput"] {\n    padding:.25rem!important;\n  }\n  [data-testid="stCameraInput"] button {\n    min-height:52px!important;\n    width:100%!important;\n    font-size:18px!important;\n  }\n  .icl-scan-hero { padding:.9rem .85rem;margin-bottom:.6rem; }\n  .icl-scan-title { font-size:23.5px; }\n  .icl-scan-flow { gap:.32rem;margin-bottom:.4rem; }\n  .icl-scan-flow span { padding:.34rem .52rem;font-size:14.2px; }\n  .icl-scan-flow i { display:none; }\n  .icl-scan-note-row span { font-size:13px; }\n  main .stButton > button,\n  main .stDownloadButton > button,\n  main [data-testid="stFormSubmitButton"] > button {\n    min-height:46px!important;\n    font-size:17px!important;\n  }\n  [data-testid="stDataFrame"] { min-height:280px; }\n  [data-testid="stDialog"] [role="dialog"] {\n    width:calc(100vw - 1rem)!important;\n    max-width:calc(100vw - 1rem)!important;\n    margin:.5rem!important;\n  }\n}\n\n/* Product UI polish — intentional density, quiet surfaces, visible focus. */\n:root {\n  --icl-space-1:4px;\n  --icl-space-2:8px;\n  --icl-space-3:12px;\n  --icl-space-4:16px;\n  --icl-space-5:24px;\n  --icl-input:#F3F5F8;\n  --icl-border-soft:#E7EAF0;\n  --icl-focus:#2F5FB7;\n}\n\n.icl-shell-header {\n  padding:12px 16px !important;\n  gap:12px !important;\n  border-color:var(--icl-border-soft) !important;\n}\n.icl-shell-title { font-size:27px !important; }\n.icl-shell-pills { gap:4px !important; }\n.icl-add-hero {\n  padding:20px 24px !important;\n  margin:8px 0 24px 0 !important;\n  border-radius:8px !important;\n  box-shadow:none !important;\n}\n.icl-add-steps { gap:8px !important; }\n\n.stTextInput input,\n.stNumberInput input,\n.stDateInput input,\n.stTextArea textarea,\n[data-baseweb="select"] > div {\n  background:var(--icl-input) !important;\n  border-color:transparent !important;\n  box-shadow:inset 0 0 0 1px #DDE3EC !important;\n}\n.stTextInput input:focus,\n.stNumberInput input:focus,\n.stDateInput input:focus,\n.stTextArea textarea:focus {\n  box-shadow:inset 0 0 0 1px var(--icl-focus), 0 0 0 2px rgba(47,95,183,.18) !important;\n}\n\nmain button:focus-visible,\n[data-testid="stSidebar"] button:focus-visible,\nmain a:focus-visible,\n[data-baseweb="select"]:focus-within {\n  outline:2px solid var(--icl-focus) !important;\n  outline-offset:2px !important;\n}\n\n[data-testid="stMetricValue"],\ninput[type="number"],\n[data-testid="stDataFrame"] {\n  font-variant-numeric:tabular-nums;\n}\n\n[data-testid="stForm"],\n[data-testid="stExpander"],\n[data-testid="stMetric"],\n[data-testid="stDataFrame"] {\n  border-color:var(--icl-border-soft) !important;\n  box-shadow:none !important;\n}\n[data-testid="stForm"] { background:#fff !important; }\n[data-testid="stAlert"] { box-shadow:none !important; }\n\n[data-testid="stSidebar"] .stButton > button { transition:none !important; }\n@media (hover:hover) {\n  [data-testid="stSidebar"] .stButton > button:hover {\n    background:#F3F5F8 !important;\n  }\n}\n\n@media (max-width:800px) {\n  .icl-shell-pills { display:none !important; }\n  .icl-add-hero { padding:16px !important; margin-bottom:16px !important; }\n}\n</style>',
     unsafe_allow_html=True,
 )
+
 st.markdown(
     "<style>" + '\n/* ICL UX v3.9 compact desktop layout */\n@media (min-width: 1101px) {\n  .block-container {\n    max-width: 820px !important;\n    margin-left: auto !important;\n    margin-right: auto !important;\n  }\n}\n\n/* The global Chemical Manager header and Add Chemical hero use the exact same\n   content width. The older shell intentionally used inline-flex/auto width,\n   which made it look shorter than the full-width Add Chemical card. */\n.icl-shell-header,\n.icl-add-hero {\n  width: 100% !important;\n  max-width: 100% !important;\n  box-sizing: border-box !important;\n}\n.icl-shell-header {\n  display: flex !important;\n  justify-content: space-between !important;\n}\n.icl-shell-pills {\n  margin-left: auto !important;\n}\n\n/* Defensive cap for Streamlit image DOM variants. Explicit st.image widths below\n   are the primary sizing mechanism; this is only a browser-side safeguard. */\nmain img {\n  max-width: 280px;\n  height: auto;\n}\n\n@media (max-width: 800px) {\n  .block-container { max-width: 100% !important; }\n  main img { max-width: min(280px, 100%); }\n  .icl-shell-header,\n  .icl-add-hero { width: 100% !important; }\n}\n' + "</style>",
     unsafe_allow_html=True,
@@ -4523,140 +3589,60 @@ def _icl_review_ready(result, candidate, acknowledged):
 
 
 def _icl_review_product(result, scope):
-    """Decision-first V8 review UI. Verification semantics are unchanged."""
     guard = __import__('icl_ocr_ui_guard')
     if not guard.is_v8(result):
-        st.warning('This OCR result needs to be refreshed. You can also enter the bottle manually.')
+        st.warning('Please analyze the photo again, or switch to manual entry.')
         return None, False
-
     state = result.get('verification_status')
-    conflicts = list(result.get('conflicts') or [])
-    meta = guard.metadata(result)
-    verified = result.get('verified_identity') or {}
-    choices = guard.candidates(result)
-
-    quick_name = (
-        meta.get('verified_label_name')
-        or meta.get('label_name')
-        or verified.get('name')
-        or (choices[0].get('name') if len(choices) == 1 else '')
-        or 'Not detected'
-    )
-    quick_cas = meta.get('cas') or verified.get('cas') or '—'
-    quick_manufacturer = meta.get('manufacturer') or verified.get('manufacturer') or '—'
-    quick_catalog = meta.get('catalog') or verified.get('catalog') or '—'
-
-    with st.container(border=True):
-        st.markdown('#### OCR result')
-        q1, q2 = st.columns(2)
-        with q1:
-            st.caption('Chemical')
-            st.markdown(f'**{quick_name}**')
-            st.caption('Manufacturer')
-            st.markdown(f'**{quick_manufacturer}**')
-        with q2:
-            st.caption('CAS No.')
-            st.markdown(f'**{quick_cas}**')
-            st.caption('Catalog No.')
-            st.markdown(f'**{quick_catalog}**')
-
-        if state == 'CONFLICT' or conflicts:
-            st.error('Review needed · conflicting identity evidence')
-        elif state == 'PRODUCT_VERIFIED':
-            st.success('Product verified')
-        elif state == 'IDENTITY_VERIFIED':
-            st.info('Identity verified · check manufacturer / catalog')
-        else:
-            st.warning('Review needed · confirm the label against a candidate')
-
-    if conflicts:
-        with st.expander('Conflicts', expanded=False):
-            for item in conflicts:
-                st.error(str(item))
-
-    key = scope + '_' + _icl_result_key(result)
-
-    def _candidate_choice_label(index):
-        if index == -1:
-            return 'None of these · manual entry / retake photo'
-        candidate = choices[index]
-        parts = [str(candidate.get('name') or 'Unnamed candidate')]
-        if candidate.get('cas'):
-            parts.append('CAS ' + str(candidate.get('cas')))
-        vendor_catalog = ' '.join(
-            part for part in (
-                str(candidate.get('manufacturer') or '').strip(),
-                str(candidate.get('catalog') or '').strip(),
-            ) if part
-        )
-        if vendor_catalog:
-            parts.append(vendor_catalog)
-        return ' · '.join(parts)
-
-    if not choices:
-        st.warning('No verified candidate was returned. Use manual entry or retake the label photo.')
-        selected = None
+    if state == 'CONFLICT' or result.get('conflicts'):
+        st.error('The name, CAS or catalog number conflicts. Check the label before continuing.')
+    elif state == 'PRODUCT_VERIFIED':
+        st.success('Product details matched. Compare them with the label and select a product.')
+    elif state == 'IDENTITY_VERIFIED':
+        st.info('Chemical identity matched. Check the manufacturer and catalog number separately.')
     else:
-        selected = st.radio(
-            'Identity match',
-            list(range(len(choices))) + [-1],
-            index=None,
-            format_func=_candidate_choice_label,
-            key=key + '_candidate',
-        )
-
+        st.warning('Review required. If the candidates do not match the label, enter details manually or take another photo.')
+    label_fields = result.get('fields') or {}
+    label_codes = {str(x.get('value', '')).strip().upper() for x in label_fields.get('catalog', [])} - {''}
+    choices = [c for c in guard.candidates(result) if c.get('catalog_correction') or not c.get('catalog') or not label_codes or str(c['catalog']).strip().upper() in label_codes]
+    if len(choices) < len(guard.candidates(result)):
+        st.warning('Candidates with a different catalog number were excluded. Rescan to refresh the lookup.')
+    if label_codes:
+        st.caption('Catalog read from label: ' + ' / '.join(sorted(label_codes)))
+    key = scope + '_' + _icl_result_key(result)
+    selected = st.radio('Select a product', list(range(len(choices))) + [-1], index=None,
+        format_func=lambda i: 'None match · Enter manually or retake' if i == -1 else guard.candidate_label(choices[i]),
+        key=key + '_candidate')
     candidate = choices[selected] if selected is not None and 0 <= selected < len(choices) else None
     acknowledged = False
-
     if candidate:
         with st.container(border=True):
-            st.caption('Selected identity')
-            st.markdown('### ' + str(candidate.get('name') or 'Unnamed candidate'))
+            st.caption('Product details to apply')
+            st.subheader(str(candidate.get('name') or 'Unnamed'))
             a, b = st.columns(2)
-            with a:
-                st.caption('CAS No.')
-                st.write(str(candidate.get('cas') or '—'))
-                st.caption('Catalog No.')
-                st.write(str(candidate.get('catalog') or '—'))
-            with b:
-                st.caption('Manufacturer')
-                st.write(str(candidate.get('manufacturer') or '—'))
-                st.caption('Formula')
-                st.write(str(candidate.get('formula') or '—'))
-
+            a.write('CAS: ' + str(candidate.get('cas') or 'Not confirmed'))
+            b.write('Manufacturer: ' + str(candidate.get('manufacturer') or 'Not confirmed'))
+            a.write('Catalog: ' + str(candidate.get('catalog') or 'Not confirmed'))
+            b.write('Formula: ' + str(candidate.get('formula') or 'Not confirmed'))
             url = str(candidate.get('source_url') or '')
             if url.startswith(('https://', 'http://')):
-                st.link_button('Open source', url)
-
-            acknowledged = st.checkbox(
-                'I compared the label name, CAS and catalog number with this candidate.',
-                key=key + '_confirm_' + str(candidate.get('candidate_id')),
-            )
+                st.link_button('Open product or chemical source', url)
+            if not candidate.get('catalog') and len(label_codes) == 1:
+                st.info('Chemical identity only. The catalog read from the label (' + next(iter(label_codes)) + ') will be retained after your review; the product itself is not independently verified.')
+            if candidate.get('catalog_correction'):
+                st.warning('Suggested catalog correction: ' + ' / '.join(candidate.get('observed_catalogs', [])) + ' → ' + str(candidate.get('catalog')) + '. Open the manufacturer source and check the original label before applying.')
+            acknowledged = st.checkbox('I compared this candidate with the name, CAS and catalog number on the label.',
+                key=key + '_confirm_' + str(candidate.get('candidate_id')))
             st.session_state[guard.review_key(result, candidate)] = bool(acknowledged)
-
-    with st.expander('Evidence & lookup details', expanded=False):
+    with st.expander('OCR text and lookup evidence'):
         observations = result.get('observations') or []
-        texts = [
-            str(o.get('text', ''))
-            for o in observations
-            if o.get('pass_id') == 'full'
-        ]
-        if not texts:
-            texts = [str(o.get('text', '')) for o in observations]
-        st.code('\n'.join(texts))
-        st.json({
-            k: result.get(k)
-            for k in ('fields', 'lookup_events', 'conflicts', 'warnings', 'runtime')
-        })
-
+        texts = [str(o.get('text', '')) for o in observations if o.get('pass_id') == 'full']
+        st.code('\n'.join(texts or [str(o.get('text', '')) for o in observations]))
+        st.json({k: result.get(k) for k in ('fields', 'lookup_events', 'conflicts', 'warnings')})
     packages = (result.get('fields') or {}).get('package') or []
     if packages:
-        package_text = ' / '.join(
-            dict.fromkeys(str(p.get('value', '')) for p in packages if p.get('value'))
-        )
-        if package_text:
-            st.caption('Package label · ' + package_text + ' · Enter the actual amount / remaining stock below.')
-
+        st.caption('Package marking: ' + ' / '.join(dict.fromkeys(str(p.get('value', '')) for p in packages))
+                   + ' · Enter the actual amount and remaining amount when registering.')
     return candidate, _icl_review_ready(result, candidate, acknowledged)
 
 
@@ -4688,12 +3674,12 @@ def _icl_scan_save(record, candidate, bottle, storage, move):
     try:
         current = conn.execute('SELECT * FROM chemicals WHERE id=? FOR UPDATE', (bottle['id'],)).fetchone()
         if not current or current['status'] == 'Disposed':
-            raise ValueError('이 병이 삭제되었거나 폐기되었습니다. 재고를 다시 확인하세요.')
+            raise ValueError('This bottle was deleted or disposed of. Refresh the inventory before continuing.')
         expected = clean_text(draft['fields'].get('cas'))
         if expected and clean_text(current['cas_number']) and expected != clean_text(current['cas_number']):
-            raise ValueError('선택한 병의 CAS가 변경되었습니다. 다시 확인하세요.')
+            raise ValueError('The bottle\'s CAS has changed. Review the record again.')
         if (current['storage_unit_id'], current['shelf_number']) != (bottle['storage_unit_id'], bottle['shelf_number']):
-            raise ValueError('다른 사용자가 보관 위치를 변경했습니다. 화면을 새로고침하고 확인하세요.')
+            raise ValueError('Another user changed the storage location. Refresh and review the record again.')
         if move:
             conn.execute('UPDATE chemicals SET storage_unit_id=?, shelf_number=?, location=?, updated_at=? WHERE id=?',
                 (storage[0], storage[1], storage[2] if storage[0] is not None else '',
@@ -4727,48 +3713,31 @@ def _icl_clear_add_identity():
 
 
 def _icl_ocr_connection_panel(scope):
-    """Keep backend diagnostics out of the normal user workflow."""
     if not get_ocr_api_key():
-        st.warning('OCR is not configured. Ask an administrator to check the Streamlit OCR secret.')
-        return
-    if CURRENT_USER.get('role') != 'admin':
-        return
-    with st.expander('OCR diagnostics', expanded=False):
-        if st.button('Check server · authentication · GPU', key=scope + '_connection'):
+        st.warning('OCR_API_KEY is missing. Check the OCR connection settings in Streamlit Secrets.')
+    with st.expander('OCR connection'):
+        if st.button('Check server connection', key=scope + '_connection'):
             try:
-                with st.spinner('Checking OCR backend…'):
+                with st.spinner('Checking the OCR server…'):
                     info = __import__('icl_ocr_ui_guard')._post(globals(), '/health/deep', {})
                 if info.get('ok') and info.get('cuda'):
-                    st.success('OCR backend ready · GPU available')
+                    st.success('Connected to the OCR server and GPU.')
                 else:
-                    st.warning('Backend responded, but the GPU check needs review.')
+                    st.warning('Please check the server response.')
                     st.json(info)
             except Exception as exc:
-                st.error('Connection check failed: ' + _icl_exception_message(exc))
+                st.error('Connection failed: ' + _icl_exception_message(exc))
 
 
 def _icl_storage_scan():
-    st.markdown(
-        """
-<div class="icl-scan-hero">
-  <div class="icl-scan-kicker">INVENTORY</div>
-  <div class="icl-scan-title">Storage Scan</div>
-  <div class="icl-scan-flow">
-    <span><b>1</b> Upload</span><i>→</i>
-    <span><b>2</b> Verify</span><i>→</i>
-    <span><b>3</b> Match bottle</span><i>→</i>
-    <span><b>4</b> Save</span>
-  </div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.header('Storage Scan')
     _icl_ocr_connection_panel('scan')
+    st.caption('Read label → Review product → Identify bottle → Save observation or register')
     if not get_ocr_api_key():
-        st.error('OCR is not configured. Ask an administrator to check the OCR secret.')
-    uploads = st.file_uploader('Bottle photo(s) or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
+        st.error('OCR is not configured. Ask an administrator to set OCR_API_KEY.')
+    uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
         accept_multiple_files=True, key='icl_scan_uploads')
-    st.caption('Each photo is reviewed as one bottle. Use Add Chemical to group multiple views of the same bottle.')
+    st.caption('Each photo is one review item. To combine multiple views of one bottle, use Add Chemical.')
     items, warnings = expand_inventory_scan_uploads(uploads)
     if warnings:
         with st.expander('Upload notes'):
@@ -4777,7 +3746,7 @@ def _icl_storage_scan():
     signature = hashlib.sha256('|'.join(i['scan_id'] for i in items).encode()).hexdigest()
     previous = st.session_state.get('inventory_scan_batch') or []
     if items and previous and st.session_state.get('icl_scan_upload_signature') != signature:
-        st.info('The upload list changed. Analyze again to refresh the review queue.')
+        st.info('Your upload list has changed. Analyze photos to update the review queue.')
     if st.button('Analyze photos', type='primary', disabled=not items or not get_ocr_api_key()):
         old = {r['scan_id']: r for r in previous}
         batch = []
@@ -4786,7 +3755,7 @@ def _icl_storage_scan():
             record = old.get(item['scan_id']) or dict(item)
             if not record.get('result') and not record.get('saved_observation_id'):
                 try:
-                    with st.spinner(f'{index + 1}/{len(items)} · {item["filename"]} 판독 중'):
+                    with st.spinner(f'{index + 1}/{len(items)} · {item["filename"]} · Analyzing'):
                         record['result'] = analyze_scan_memory_item(item, enable_pubchem=True)
                     record.pop('error', None)
                 except Exception as exc:
@@ -4799,36 +3768,36 @@ def _icl_storage_scan():
         st.rerun()
     batch = st.session_state.get('inventory_scan_batch') or []
     if not batch:
-        st.info('Upload bottle photos to verify them and link observations to inventory.')
+        st.info('Upload photos to review product details and link them to your inventory.')
         return
     done = sum(bool(r.get('saved_observation_id') or r.get('registered_bottle_id') or r.get('skipped')) for r in batch)
-    st.progress(done / len(batch), text=f'처리 완료 {done} / {len(batch)}')
-    selected_index = st.selectbox('검토할 사진', range(len(batch)), key='icl_scan_selected',
-        format_func=lambda i: f'{i + 1}. {batch[i]["filename"]}' + (' · 완료' if batch[i].get('saved_observation_id') or batch[i].get('registered_bottle_id') or batch[i].get('skipped') else ' · 검토 대기'))
+    st.progress(done / len(batch), text=f'Completed {done} / {len(batch)}')
+    selected_index = st.selectbox('Photo to review', range(len(batch)), key='icl_scan_selected',
+        format_func=lambda i: f'{i + 1}. {batch[i]["filename"]}' + (' · Complete' if batch[i].get('saved_observation_id') or batch[i].get('registered_bottle_id') or batch[i].get('skipped') else ' · Pending review'))
     record = batch[selected_index]
     scope = 'scan_' + record['scan_id']
     st.image(record['bytes'], caption=record['filename'], width=440)
     if record.get('saved_observation_id') or record.get('registered_bottle_id'):
-        st.success('저장 완료 · ' + str(record.get('registered_bottle_id') or '기존 병에 관찰 사진을 연결했습니다.'))
+        st.success('Saved · ' + str(record.get('registered_bottle_id') or 'Observation linked to the existing bottle.'))
         return
     if record.get('skipped'):
-        st.info('건너뛴 사진입니다.')
-        if st.button('다시 검토', key=scope + '_unskip'):
+        st.info('This photo was skipped.')
+        if st.button('Review again', key=scope + '_unskip'):
             record.pop('skipped', None)
             st.rerun()
         return
     if record.get('error'):
-        st.error('판독 실패: ' + record['error'])
+        st.error('Analysis failed: ' + record['error'])
     retry, skip = st.columns(2)
-    if retry.button('이 사진 다시 판독', key=scope + '_retry'):
+    if retry.button('Retry this photo', key=scope + '_retry'):
         try:
-            with st.spinner('원본 사진을 다시 판독하고 있습니다.'):
+            with st.spinner('Analyzing the original photo again…'):
                 record['result'] = analyze_scan_memory_item(record, enable_pubchem=True)
             record.pop('error', None)
         except Exception as exc:
             record['error'] = _icl_exception_message(exc)
         st.rerun()
-    if skip.button('이 사진 건너뛰기', key=scope + '_skip'):
+    if skip.button('Skip this photo', key=scope + '_skip'):
         record['skipped'] = True
         st.rerun()
     result = record.get('result') or {}
@@ -4836,16 +3805,16 @@ def _icl_storage_scan():
         return
     candidate, ready = _icl_review_product(result, scope)
     if not ready:
-        st.caption('제품 선택과 원본 대조를 마치면 저장 방법이 표시됩니다.')
+        st.caption('Select a product and confirm the label match to continue.')
         return
-    action = st.radio('이 사진의 병은?', ['기존 병 · 사진과 관찰 기록 추가', '새 병 · 새 Bottle ID로 등록'],
+    action = st.radio('How would you like to handle this bottle?', ['Existing bottle · Add an observation', 'New bottle · Create a Bottle ID'],
         index=None, key=scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_action')
     if not action:
         return
     storage_options = get_storage_options()
-    if action.startswith('새 병'):
-        location = st.selectbox('새 병의 보관 위치', storage_options, format_func=lambda x: x[2], key=scope + '_new_storage')
-        if st.button('등록 폼으로 가져오기', type='primary', key=scope + '_new'):
+    if action.startswith('New bottle'):
+        location = st.selectbox('Storage location for the new bottle', storage_options, format_func=lambda x: x[2], key=scope + '_new_storage')
+        if st.button('Continue to registration', type='primary', key=scope + '_new'):
             _icl_clear_add_identity()
             # Clear an earlier Add Chemical group so it cannot replace this handoff.
             for k in ('add_ocr_batch', 'icl_add_batch', 'add_ocr_records', 'add_ocr_groups', 'add_ocr_group_photos', 'add_ocr_group_id'):
@@ -4857,75 +3826,51 @@ def _icl_storage_scan():
             st.session_state['icl_add_context'] = _icl_result_key(result)
             st.session_state['add_storage'] = location
             st.session_state['icl_scan_handoff'] = True
-            st.session_state['icl_add_mode'] = '사진으로 입력'
-            st.session_state['icl_previous_add_mode'] = '사진으로 입력'
+            st.session_state['icl_add_mode'] = 'Photo entry'
+            st.session_state['icl_previous_add_mode'] = 'Photo entry'
             st.rerun()
         return
     matches = _icl_exact_bottle_matches(candidate)
     if not matches:
-        st.info('일치하는 재고가 없습니다. 새 병 등록을 선택하거나 Inventory에서 기존 정보를 확인하세요.')
+        st.info('No matching inventory records were found. Register a new bottle or check the existing record in Inventory.')
         return
-    st.caption('같은 시약이라도 병은 여러 개일 수 있습니다. 실제 Bottle ID를 확인해 주세요.')
+    st.caption('Several bottles may contain the same chemical. Check the physical Bottle ID before linking this photo.')
     mapping = {m['id']: m for m in matches}
-    bottle_id = st.selectbox('실제 병 선택', list(mapping), index=None,
-        format_func=lambda i: f'{mapping[i]["bottle_id"]} · {mapping[i]["chemical_name"]} · {mapping[i]["location_text"] or "미지정"}',
+    bottle_id = st.selectbox('Select the physical bottle', list(mapping), index=None,
+        format_func=lambda i: f'{mapping[i]["bottle_id"]} · {mapping[i]["chemical_name"]} · {mapping[i]["location_text"] or "Not assigned"}',
         key=scope + '_' + candidate['candidate_id'] + '_bottle')
     if bottle_id is None:
         return
     bottle = mapping[bottle_id]
     key = scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_' + str(bottle_id)
-    observed = st.selectbox('사진을 촬영한 보관 위치', storage_options,
+    observed = st.selectbox('Observed storage location', storage_options,
         index=current_location_index(storage_options, bottle['storage_unit_id'], bottle['shelf_number']),
         format_func=lambda x: x[2], key=key + '_storage')
-    move = st.checkbox('재고의 현재 보관 위치도 이 위치로 변경', value=False, key=key + '_move')
-    st.write('연결할 병: **' + str(bottle['bottle_id']) + '**')
-    st.write(('위치 변경: ' if move else '관찰 위치만 기록: ') + observed[2])
-    confirm = st.checkbox('사진의 실제 병과 선택한 Bottle ID가 같으며, 위 처리 내용을 확인했습니다.',
+    move = st.checkbox('Also update the bottle\'s current storage location', value=False, key=key + '_move')
+    st.write('Bottle to link: **' + str(bottle['bottle_id']) + '**')
+    st.write(('Update location to: ' if move else 'Record observation at: ') + observed[2])
+    confirm = st.checkbox('I checked the physical Bottle ID and the action shown above.',
         key=key + '_' + hashlib.sha256(repr((observed, move)).encode()).hexdigest()[:12] + '_save_confirm')
-    if st.button('관찰 기록 저장', type='primary', disabled=not confirm, key=key + '_save'):
+    if st.button('Save observation', type='primary', disabled=not confirm, key=key + '_save'):
         try:
             record['saved_observation_id'] = _icl_scan_save(record, candidate, bottle, observed, move)
             record['resolved_action'] = 'existing_bottle_observation'
         except Exception as exc:
-            st.error('저장하지 못했습니다: ' + _icl_exception_message(exc))
+            st.error('Could not save: ' + _icl_exception_message(exc))
         else:
             st.rerun()
 
 
 def _icl_add_photos():
-    st.markdown(
-        """
-<div class="icl-add-hero">
-  <div>
-    <div class="icl-add-kicker">BOTTLE REGISTRATION</div>
-    <div class="icl-add-title">Add Chemical</div>
-  </div>
-  <div class="icl-add-steps">
-    <span><b>01</b> Upload</span>
-    <span><b>02</b> Review</span>
-    <span><b>03</b> Register</span>
-  </div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.header('Add Chemical')
     _icl_ocr_connection_panel('add')
-
+    st.caption('Review the label, apply the product details, then enter the amount and storage location.')
     if st.session_state.get('icl_saved_notice'):
         st.success(st.session_state['icl_saved_notice'])
-        if st.button('Back to Storage Scan'):
+        if st.button('Return to Storage Scan'):
             st.session_state['_pending_navigation'] = 'Inventory Scan'
             st.rerun()
-
-    mode_options = ['사진으로 입력', '직접 입력']
-    mode = st.radio(
-        'Input method',
-        mode_options,
-        horizontal=True,
-        key='icl_add_mode',
-        format_func=lambda value: 'Bottle photos' if value == '사진으로 입력' else 'Manual entry',
-    )
-
+    mode = st.radio('Entry method', ['Photo entry', 'Manual entry'], horizontal=True, key='icl_add_mode')
     if st.session_state.get('icl_previous_add_mode') != mode:
         if st.session_state.get('icl_previous_add_mode') is not None:
             _icl_clear_add_identity()
@@ -4933,95 +3878,51 @@ def _icl_add_photos():
         st.session_state['icl_previous_add_mode'] = mode
         if not st.session_state.get('icl_scan_handoff'):
             st.session_state.pop('icl_add_context', None)
-
-    if mode == '직접 입력':
-        st.caption('Enter the exact label name and CAS number in Bottle details below.')
+    if mode == 'Manual entry':
+        st.caption('Enter the chemical name and CAS exactly as shown on the label.')
         return None, [], True
-
     if st.session_state.get('icl_scan_handoff'):
         result = st.session_state.get('add_ocr_result') or {}
         records = st.session_state.get('icl_applied_photos') or []
-        st.info('Product selected in Storage Scan. Review the bottle details before registration.')
-        if st.button('Start with different photos'):
+        st.info('Product details from Storage Scan are ready. Review the registration form below.')
+        if st.button('Start with another photo'):
             st.session_state.pop('icl_scan_handoff', None)
             st.session_state.pop('icl_add_batch', None)
             _icl_clear_add_identity()
             st.rerun()
     else:
         nonce = st.session_state.get('icl_add_upload_nonce', 0)
-        st.markdown('#### Bottle photos')
-        uploads = st.file_uploader(
-            'Bottle label photo(s) or ZIP',
-            type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
-            accept_multiple_files=True,
-            key='icl_add_upload_' + str(nonce),
-            help='Upload one or more views. ZIP files are expanded automatically.',
-        )
-        with st.expander('Use camera', expanded=False):
-            camera = st.camera_input(
-                'Capture the front label',
-                key='icl_add_camera_' + str(nonce),
-            )
-
-        items, warnings = expand_inventory_scan_uploads(
-            list(uploads or []) + ([camera] if camera else [])
-        )
+        uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
+            accept_multiple_files=True, key='icl_add_upload_' + str(nonce))
+        with st.expander('Take a photo'):
+            camera = st.camera_input('Photograph the front of the label', key='icl_add_camera_' + str(nonce))
+        items, warnings = expand_inventory_scan_uploads(list(uploads or []) + ([camera] if camera else []))
         if warnings:
-            with st.expander('Upload notes', expanded=False):
+            with st.expander('Upload notes'):
                 for warning in warnings:
                     st.write(warning)
-
         groups = {}
         if items:
-            grouping_options = ['사진마다 서로 다른 병', '전부 같은 병의 여러 면', '병별로 직접 묶기']
-            grouping = st.radio(
-                'Grouping',
-                grouping_options,
-                key='icl_add_grouping',
-                horizontal=True,
-                format_func=lambda value: {
-                    '사진마다 서로 다른 병': 'One bottle per photo',
-                    '전부 같은 병의 여러 면': 'All photos = one bottle',
-                    '병별로 직접 묶기': 'Custom grouping',
-                }[value],
-            )
-            if grouping == '병별로 직접 묶기':
-                with st.expander('Assign bottle numbers', expanded=True):
-                    st.caption('Use the same number for photos of the same physical bottle.')
+            grouping = st.radio('How are these photos grouped?', ['Each photo shows a different bottle', 'All photos show the same bottle', 'Assign groups manually'],
+                key='icl_add_grouping', horizontal=False)
+            if grouping == 'Assign groups manually':
+                with st.expander('Assign the same group number to photos of one bottle', expanded=True):
                     for i, item in enumerate(items):
-                        groups[item['scan_id']] = int(st.number_input(
-                            item['filename'],
-                            min_value=1,
-                            max_value=120,
-                            value=i + 1,
-                            step=1,
-                            key='icl_group_' + item['scan_id'],
-                        ))
+                        groups[item['scan_id']] = int(st.number_input(item['filename'], min_value=1, max_value=120,
+                            value=i + 1, step=1, key='icl_group_' + item['scan_id']))
             else:
-                groups = {
-                    item['scan_id']: (1 if grouping.startswith('전부') else i + 1)
-                    for i, item in enumerate(items)
-                }
-            st.caption(f'{len(items)} photo(s) · {len(set(groups.values()))} bottle(s)')
-
-        too_many = any(
-            list(groups.values()).count(g) > 12
-            for g in set(groups.values())
-        )
+                groups = {item['scan_id']: (1 if grouping.startswith('All photos') else i + 1) for i, item in enumerate(items)}
+            st.caption(f'{len(items)} photos · {len(set(groups.values()))} bottles to review')
+        too_many = any(list(groups.values()).count(g) > 12 for g in set(groups.values()))
         if too_many:
-            st.warning('A single bottle can contain up to 12 evidence photos.')
-
-        if st.button(
-            'Analyze photos',
-            type='primary',
-            disabled=not items or too_many or not get_ocr_api_key(),
-        ):
+            st.warning('A bottle can have up to 12 photos.')
+        if st.button('Analyze photos', type='primary', disabled=not items or too_many or not get_ocr_api_key()):
             batch = []
             progress = st.progress(0.0)
             for i, item in enumerate(items):
                 record = dict(item, group_id=groups[item['scan_id']])
                 try:
-                    with st.spinner(f'{i + 1}/{len(items)} · analyzing {item["filename"]}'):
+                    with st.spinner(f'{i + 1}/{len(items)} · {item["filename"]} · Analyzing'):
                         record['result'] = analyze_scan_memory_item(item, enable_pubchem=True)
                 except Exception as exc:
                     record['error'] = _icl_exception_message(exc)
@@ -5031,52 +3932,19 @@ def _icl_add_photos():
             st.session_state.pop('icl_add_group_selected', None)
             st.session_state.pop('icl_saved_notice', None)
             st.rerun()
-
         batch = st.session_state.get('icl_add_batch') or []
         if not batch:
-            st.caption('No photo is required for Manual entry.')
+            st.caption('To register without a photo, select Manual entry above.')
             return None, [], False
-
         group_ids = sorted(set(r['group_id'] for r in batch))
-        group_id = st.selectbox(
-            'Bottle to review',
-            group_ids,
-            key='icl_add_group_selected',
-            format_func=lambda g: f'Bottle {g} · {sum(r["group_id"] == g for r in batch)} photo(s)',
-        )
-        selected_index = group_ids.index(group_id)
-        st.caption(
-            f'Bottle {selected_index + 1} of {len(group_ids)} · '
-            f'{sum(r["group_id"] == group_id for r in batch)} photo(s)'
-        )
-
-        if len(group_ids) > 1:
-            prev_col, spacer_col, next_col = st.columns([1.45, 3.8, 1.45])
-            with prev_col:
-                if st.button(
-                    '← Previous bottle',
-                    key=f'icl_add_prev_{group_id}',
-                    width='stretch',
-                    disabled=(selected_index <= 0),
-                ):
-                    st.session_state['icl_add_group_selected'] = group_ids[selected_index - 1]
-                    st.rerun()
-            with next_col:
-                if st.button(
-                    'Next bottle →',
-                    key=f'icl_add_next_{group_id}',
-                    width='stretch',
-                    disabled=(selected_index >= len(group_ids) - 1),
-                ):
-                    st.session_state['icl_add_group_selected'] = group_ids[selected_index + 1]
-                    st.rerun()
-
+        group_id = st.selectbox('Bottle to review', group_ids, key='icl_add_group_selected',
+            format_func=lambda g: f'Bottle {g} · {sum(r["group_id"] == g for r in batch)} photos')
         records = [r for r in batch if r['group_id'] == group_id]
         if any(r.get('error') for r in records):
             for r in records:
                 if r.get('error'):
                     st.error(r['filename'] + ': ' + r['error'])
-            if st.button('Retry failed photo(s)'):
+            if st.button('Retry failed photos'):
                 for r in records:
                     if r.get('error'):
                         try:
@@ -5086,49 +3954,35 @@ def _icl_add_photos():
                             r['error'] = _icl_exception_message(exc)
                 st.rerun()
             return None, [], False
-
         merged = __import__('icl_ocr_ui_guard').merge_group(globals(), records, group_id)
         if merged.get('error'):
-            st.error('Could not resolve this photo group: ' + merged['error'])
+            st.error('Could not resolve the photo group: ' + merged['error'])
             return None, [], False
         result = merged.get('result') or {}
-
     context = _icl_result_key(result)
     if st.session_state.get('icl_add_context') != context:
         _icl_clear_add_identity()
         st.session_state['icl_add_context'] = context
-
-    # Decision-first review: do not repeat full uploaded photos. Show the OCR label
-    # crop first; source photo names remain available for provenance.
-    label_crop = decode_ocr_label_crop(result)
-    if label_crop:
-        st.markdown('#### Detected label')
-        st.image(label_crop, width=300)
     if records:
-        with st.expander(f'Source photos ({len(records)})', expanded=False):
-            for record in records:
-                st.write('• ' + str(record.get('filename') or 'photo'))
-
+        st.image(records[0]['bytes'], caption='Original photo · ' + records[0]['filename'], width=440)
+        if len(records) > 1:
+            with st.expander(f'Additional views of this bottle: {len(records) - 1} photos'):
+                for record in records[1:]:
+                    st.image(record['bytes'], caption=record['filename'], width=360)
     candidate, ready = _icl_review_product(result, 'add')
-    if st.button('Apply result', type='primary', disabled=not ready):
-        load_add_form_from_ocr(
-            result,
-            records[0]['bytes'] if records else None,
-            records[0]['filename'] if records else 'bottle.jpg',
-            selected_candidate=candidate,
-            evidence_photos=records,
-        )
+    if st.button('Apply selected product to form', type='primary', disabled=not ready):
+        load_add_form_from_ocr(result, records[0]['bytes'] if records else None,
+            records[0]['filename'] if records else 'bottle.jpg', selected_candidate=candidate, evidence_photos=records)
         st.session_state.pop('_pending_navigation', None)
         st.session_state['icl_applied_result_key'] = context
         st.session_state['icl_applied_photos'] = list(records)
         st.rerun()
-
     applied = st.session_state.get('icl_applied_result_key') == context
     if applied:
         fields = (st.session_state.get('icl_v8_registration_draft') or {}).get('fields') or {}
-        st.caption('Applied to Bottle details · ' + str(fields.get('name', '')))
+        st.success('Applied to form: ' + str(fields.get('name', '')))
         if candidate and candidate.get('name') != fields.get('name'):
-            st.warning('The selected candidate changed. Apply the result again to update Bottle details.')
+            st.warning('You selected a different candidate. Apply it to update the form.')
     return result, records, applied
 
 
@@ -5822,28 +4676,12 @@ st.markdown(
 # Render the original repository PNG directly. Streamlit preserves the aspect
 # ratio, so the laboratory logo is never vertically compressed.
 st.sidebar.image(
-    "assets/logo_full.png",
-    width=238,
+    BytesIO(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAABDMAAAFeCAYAAACYZVSYAABbg0lEQVR42u3df2wcd3rn+c9T4oyNswzpsFioq3W3ZNaKk92bBTl3i90LxDlxboGRQhXP7bUCCwg24lw0GMxaG1OzOxjdwbBkx9g4mM2Is2fvIBgFphIEsC5yTIMtRhpgb2gMdTnsDZAmbv7I+qQLiYW7W38cIMHywfZQ9dwf3ZJJieyq/sn+8X4B3s3Yxeqqp75VXc/T3x8SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKCdjBAA2CQTTTzy7wLbG8jH0u4ijm1V8tVH/kM5v0SAAQAAADSLYgbQ7zK5EWl9ZGNBwt3HJNtbfQqMybVnB54+d+QqSJJZpfgRu9+WW0EShQ8AAAAANdIJAL2vWrAIAk3ItdelMUkjkoZ7/AlVLXj4bTMrxLKC7N6qPlwscNEBAACAwUUxA+g1mWhC5mOBBWPuPiLp0IBGYsXMCpKvxrGW9PhQQavzt2kgAAAAQP+jmAF0s/2TY4ptolq4GJM0SlBqWjGzQhxrSbvuFejBAQAAAPQnihlAN6kWL0yakNnEjsxl0V9PuDtyX3JpSf6FeZXnVwkKAAAA0A+v+gB2TiY3IvtFjuJFx6yZ2VIszau4ME84AAAAgN5EMQPotP2TY0EcTLs0IYaN7DB/zz2Y1+O75plvAwAAAOgdicWMIBudc9dZQvVQ4EyvxMX8OSKBVLJTuUDKuTxH74tuRWFjUPE9x/ccAADoPUOEAGiT/ZNjge+aqRQwfI8TkW5P3Z4x82f06fpbCo9WChvlhTniAgAAAHQfihlAK2VyI0GwPu2uacUadlHC6E3VwkY2mjXZfGz3ZlkZBQAAAOgeFDOAVshMTZv5tLR+yKlf9A/XHpefMA9OKIxW3G2WYSgAAADAzqOYATTqfi8MaUbuzIPR/0bN/C19tj5rYTQX+9AsS70CAAAAOyMgBECdMtFEkJ2aM1v/G3edZULPAePa49KLZut/E2Sn5rR/coygAAAAAJ1FMQNIKxNNWBgtmekn7n6CgMDdT1gc/JWF0ZIy0QQRAQAAADqDYgaQJDM1bWG0aqafSDpEQLCFQ2b6CUUNAAAAoDMoZgDbeVDE8LckDRMQpEBRAwAAAOgAJgAFHpadypn7rOQUMNCoQ2b6icLoffehaSYKBQAAAFqLnhnAfffnxHB/V/TEQGscejBR6EhuL+EAAAAAWoNiBpDJjVh4dJ45MdAu7n7CPltfVXh0hmgAAAAAzaOYgcE1ktsbZKNzZut/I9kzBARt5dpjsvMWRqvMpwEAAAA0h2IGBlN2KmefrhfcdZZgoMOGzfQThp4AAAAAjaOYgcGSyY0wLwa6wYOhJ9mpHNEAAAAA6kMxA4MjPDpjwXpBzIuBbuHaY+7vVpZyzY0QEAAAACAdihnof/snxyyMCiY7L9ceAoIudMiC9QK9NAAAAIB0KGagv4VHZywO/krSKMFAV3vQS+PoPHNpAAAAALVRzEB/uj83huw8wUBvsWfs0/UCK54AAAAA26OYgf6TncoxNwZ6XHXFk+gcoQAAAAAeRTED/WMktzfITs2Z+7vMjYF+4K6zFkZLDDsBAAAANqOYgf6wf3LMPl1fcvcTBAN95pB9tr6q/ZNjhAIAAACooJiB3pedypkHS2KST/Qr1x6Lg79SZmqaYAAAAAAUM9DrDTiMZhlWgkFh5m8F2ak5IgEAAIBBN0QI0JNGcnvt01/MufQMwcAgcfcTFkYj/thQTqvzt4kIAAAABhE9M9B7qvNjSEYhA4PqkH26vsQ8GgAAABhUFDPQW/ZPjjE/BiBJGjUPKGgAAABgIFHMQO/ITE1bHPwV82MAVa495sGSslM5ggEAAIBBQjEDvSEzNW3mbxEI4CGuPeb+LiudAAAAYJBQzED3N9Ls1ByFDKA2M3+LggYAAAAGJk8kBOjqBpqdmnP3E0QCSEZBAwAAAAOTKxICdG3jpJAB1I2CBgAAAAYiXyQE6MqGSSEDaBgFDQAAAPR9zkgI0FVGcnspZADNo6ABAACAfkYxA92VgH26Pk8hA2jR/URBAwAAAH2KYga6pzFmp+YkHSISQOtQ0AAAAEBf5o+EAF3REBlaArSNmb+l/ZNjRAIAAAB9k0MSAux4I6SQAbSdebBEQQMAAAB9k0cSAuxoA6SQAXSGa4/FwbxGcnsJBgAAAHo+lyQE2DHh0RkKGUBHDdun60sUNAAAANDrKGZgZ2Smpk12nkAAHTcafHZvljAAAACgl1HMQOdlogkzf4tAADvD3U8oPDpDJAAAANCrKGags/ZPjlmgeQIB7CyTnVcmmiASAAAA6EUUM9A5I7m95sGSXHsIBrDzLBATggIAAKAnUcxAZ4zk9tqn6xQygG7i2mOfrs8TCAAAAPQaihnoTEOrTDg4SiSArnMoyEbnCAMAAAB6KsckBGh7I8tG51iCFehe7jrL/BkAAADoqTyTEKCtslM5d50lEEB3M9Mc82cAAACgV1DMQPvsnxwz+RyBAHrCcHU4GAAAAND1KGagPUZyey0O5pjwE+gd7n5C2akckQAAAEC3o5iB9jQsJvwEepLJGW4CAACArjdECNBymalpJvzsKyuSbj+a9Kogq/x7d01skRWP0TOnB7n2BJ+un4ulGYIBAACAbkUxA621f3LM3GflhKInmO7IVbhfmIhlBcV+W48PFbQ6f7t2zpvSSG6vPlkfU2B7A/mYu49JNiJ67nQtl15UJppXOb9ENAAAANCNKGagdUZye+3T9TmJX+O71JrkBTMrxLGWNhYs2lp7qnzGkiTF0vym/5aJJmQ+ZtKEzCboydE9zDTr0hiRAAAAQDeimIGWCT5dP+f82t5F2ajumGw+jrUk7VpSeX5VUnd1mqn88r/k0qwkaf/kmGKbMFlO0iEu4o4aDbLRubiYP0coAAAA0G0oZqA1MtGESy8SiB23Yqb52OJ5fbhY6LnRPh8uFiQVXJqtDE+5lzOLc5I9w6XtPJdmNJKbTRpyBAAAAHQaxQw0byS31z5bn2eejB2zZtJ87EOzKs+v9s1lqCTQcy7NKZMbkf0iZ7IZScNc8g5x7Qk+uzcbS9MEAwAAAN2EpVnRNPv0F3PMdbADcTe76K6veik/EpfyM/eHkfSl8vyqSldmvZQfcddXJb1PC+gMdz+h/ZNjRAIAAADdhGIGmpOdyjEEoINMd8z0ivvQL8XFhemBXG2inF/yUn7CfeiXzOwijaIDzS4OZokCAAAAugnFDDRuJLfX5HMEohPZZLWI8cWhkbiYP9fXvTDSKs+vxsWFaYoaHXFImWiCMAAAAKBbUMxA443ns3uzDC9ps4eLGEzE+KgNRQ0x/KR9TdF0jigAAACga/JRQoCGZKIJdz9BINqaPFLEqEd5frUy/ERflbRGQFqO3hkAAADoGhQz0GiiPUcU2ub9ypwYFDEaUplTY8RMrxCMlt/354gCAAAAugHFDNTfaLLRObE8ZhsyRd1xs2e9lJ9gTozmxcX8OQ/iL0taIRotQ+8MAAAAdEdeSghQl0xuxF1nCUSr+Xv+xaERFRfmiUULfbhY8FJ+jF4arUPvDAAAAHQDihmoM5H5xSxRaGVAdcfdvu6lKzmGlLTPhl4azKXRPHpnAAAAYMdRzEB6mWhCsmcIRMuseDw0pvLCHKHogA8XC/7Y0Jjk7xGM5pj5DFEAAADATqKYgToSGCb9bF0s7aI/NsTcGJ22On/bS1dyLj9NMJpqwc8okxshDgAAANgpFDOQTmZqWkz62RLu9vW4uDDNsJIdVLoy62bPynSHYDT45WHrM0QBAAAAO/Y+SgiQaCS31wKfJRBNqq5WwrCSLlFcmHeLJyhoNMZN0xrJ7SUSAAAA2AkUM5DcSD5bn5FrD5FogumOWzzBaiVd5sPFgn9xaEQs31o/1x59ci9HIAAAALAjeSohQE0jub0uzRCIpqy5xRP6cLFAKLrQ6vxtf2xoQhQ06sZEoAAAANgpFDNQu4F8un6OXhlNWfHHhsYoZHQ5ChqNGtX+yTHCAAAAgI7nqoQA28rkRlx6kUA0bMUfG5pgos8eQUGjsS+ROJgmCgAAAOj4eyghwLaNI7h3jig0yHSHQkYPoqBRNzdNEwUAAAB0PF8lBNhSJjfi7icIRAPuT/ZJIaM3UdCoj2uPslM5AgEAAIBOopiBrRsGvTIac7+QwRwZvW11/rb7UI5lW1N/keSIAgAAADr8Dgo8ZCS3l14ZjXHZNIWMPlGeX3WLJyhopGj37ic0kttLJAAAANApFDPwaKP4bH2GKDSQ0MlPq7gwTyT6yIeLBY+N+yGNT+7lCAIAAAA6lrcSAmwyktvrEslbnczsokpXZolEHyovzJnZRQKR8GUSaIIoAAAAoGPvn4QAm3z6i2m59hCIuqzEX9w1Qxj6V1xcmBYTgtbk8hxRAAAAQKdQzMAmJrrU1xmwOx7E06xcMgDJehBPM39GrQCxqgkAAAA6h2IGPpeZmpY0TCDqyN9im2HCzwHx4WLB3c8RiBpfKO4TRAEAAAAdefckBLjPzKeJQj3xsosqL8wRiQFSmRflfQKxNWeJVgAAAHQIxQxU7J8ck3SIQKS2xjwZA5qwBzHXfXvDyuRGCAMAAADajWIGKg3BSczrSmhdzJMxqD5cLJj0AwKxDftFjiAAAACg7TksIUBlOVZWIkidq0k/UDm/RCQGV/zY0DkmA932/pggCgAAAGg3ihmQPrmXYznW1Nbix4bOEYYBtzp/26RZArEFswmCAAAAgHajmAGZ+QxRSMfNZhheAkmKi/lzktaIxMM3ifZU5+ABAAAA2oZixqCrJB2jBCKV91VcmCcM+Dxv91misIXYJggCAAAA2olixqA3gDiYJgopE1cfIlbY7LEvzDF3xqOYNwMAAABtz2UJwYAn6CYS9DTJmekVledXiQQ2Ye6M7W6YCYIAAACAdqKYMciyU0z8mSox0534i0MkrNhSHA/NEYWHuPYokxshEAAAAGgXihmDffFzRCFFXhYz6SdqKM+vSv4egXj4AXNvjCAAAACgjfksBjZJl+eIQqI1lRfmCANq3ksW0EYe+XLxMaIAAACA9r1vYjAxxCRdkup2jiggUXFhnolAH753mAQUAAAA7UMxY3AvfI4oJKJXBlIz2TxR2BSQMYIAAACANua0GEQMMUkRI3ploA6xNE8UNj1kmAQUAAAAbUMxYxAxxCQNemWgPsWFeYLwsPURYgAAAIB2oJgxmBc9RxRqo1cGGvQ+IdjwrAmYNwMAAABty2sxcIk6Q0xqM93R47vmCQTqbjqmJaKwKSIjxAAAAADtQDFj0OyfHGOISUL6Jc1qdf42kUC94phixkbuPkIUAAAA0A4UMwbtgnuQIwpJCenQHFFAQ8r5JYKwASuaAAAAoF25LSEYLO7Ml5EQofdUnl8lDmjCCiG4fzvRCwwAAADtQTFjkIzk9koaJRA1ci8L5ogCmmFmBaKwQSaaIAgAAABoNYoZg+STezmCUNMay2uieb5KDAAAAID2opgxSBebZRJrMtMcUUCzmASU5w4AAADab4gQDA53J6momYQy8Sda4PGhgn+y/lUCcf+5M7RKFAAAANBqFDMGRSY3Iq0PE4htrTDxJ1qisqzvEoEAAAAA2odhJgPj3gQx2J7L54gCAAAAAPQGemYMiCDQhDtx2NZjX5gjCAAAAABq5lXZqTl3PyJp3+f/1q+7279WOb9IhDp4LQjBYGC+jJrerw4NAAAAAIAtWRhddfcT2lTIkCQ7aKYryky9TJQ6h2LGIBjJ7ZXEfBnbcPk8UQAAAACwbeKcnZqTdLjWNmb+r5SNxolWh64JIRgAnzFfRk3+hXmCAAAAAGDblMH9WIrNngxkJ4lWZ1DMGIiL7GNEYVusYgIAAAAgyRNpNnIn9+oUJgAdAO6aIApbM2mJeVEBAEDL3zGy0YJc/2XNdzTT76mYv0S0AKB+FDMGI2MfExn7lmLXPFEAAAAtVylkjNbexkMCBfSMj5Wud8YNQtUZDDPpd/snx+TaQyC2YLqjcn6JQAAAAABIsJxmIzfNEqrOoJjR73zXCEHYLja+RBAAAAAAJKYOir8p6YNa25jZRRXzy0SrMyhm9P0FZgKa7R9IWiIKAAAAABKVFtdc8dckXdviv95y2bfj4sI0geoc5szo94SdyT+3F9AzAwAAAEBKpcU1l44onByW7FlJklmJiXx3BsWMfsfkn9vF5Y4+XCwQCAAAAAB1KS2uScyNsdMYZtLPRnJ7mfxzG64CQQAAAACA3kTPjH72yfqYjDBsxUxLdFgBAAB9LRuNy/0fBh5kFCijWOXY4rLMfrYjkxRWu+Y/OJ777h+X/N3qL95dF7/Y/IZK+QuNn/vRmYfPO3a/Ifldla7MdtX5mh2QbPfnxxkXdqzN1Hf8z8s9vH/8D+LbC8dez/0ivxu73+jZ86KYgXQZu4+JasaW4pjJPwEAQHcLMtHbbnq+1jYuP70pGc5G4+Z6SdKYXPskk5tLLskkk1X+7zD6WNKyS5ebStJTJJjm+g1J45L2Sfr8eB68s1aPS3ZeYXRL0rKb/qzZeQgsjP5a0q/UjF8pbw8n9OaakTS+MX6B2cVYulDf9Zt63S0el+zgVudt9//fMDov+XWXXVUp/1q9bcBcl+Jy/nijBYxAdtLdjzw4X6+0rM+P005U28z9azP7cBLdUKxbcb3C6KRJx6rX64mNx/8gvgnHnr64cHTGZOcTtvqPXsr/ahP3S6X9VaYKeGrL+0UP38deMA+W4/LCGYoZ6J8vQNkIvQ+28fhQgSAAAIDufpmzT6qZWYpEa3LYFPyhXIdT7v0JSYdNOqwwOuWmUy39lbeSZJ6Sa7TOv9wn6TlzPacw+p9ceqOJYssndYU7OzXn7v9U0pPNnfvUaZN/1+X70v+waAdNOqhsNO2xfkfl/GLqNhDYJ/Uf4+SwKfgDuZ7z9BPsPbg2lp26GPu9sxt60nzSglaTfh+ZaNJM/1pK3b42tqtrrvibbeoF1Fgc7hch79+/6ZO4JyQ76OYHLYymzW1ukIoazJnRx1waIwpbWtPq/G3CAAAA+kImmjQFP5dSFzIeNmquRWWmXm6+iDE5bGFUMOlHdSSa2x+X9CMLjy5Xuty3SfWY3f1EU4WMcHLYwqPLJv9+NXlu5AX+KTNdCbJTc21tLxb8paTnGs4z3E+Ygh8rE012vr1PvWymK020r8Om4Oc7cuxbJeTZ6A1z/bSJ+/e+fW7+XctGN5SNxgfh0Ucxo7+NEIItH78FYgAAAPqByY5UE7vdTe7qSTN/pamCxudFldEWn+XBtiWflR4KP276mB/spzKkpOm3VfcTFkZX21YIcIUt2NvTZnq7o0WBzNTLZv5KC/a0u+PHvlXLDqOr7nqhtamOnqoUJ7ujWNNOFDP62zAh2OKhYVYgCgAAoE8cbuXOzPwVhdHJ+pPMaNJMb6v5okpHk09T8IeSnm5qJ58XRJ5u9bV19/+hZXsLp063qBCw0ZPV6/5fdOY9vqXHXzn2HerFYGH081bfv4+cW58XNChm9Kv9k2MEYWtM/gkAAFArYdSrdQ3r+LyQ8WSbD60dCVrTyaTJ/lStL2Tc95+3ZC/ZaNzU8kLGg+si6W/1aHN/0lxvdPweq/S6+a/afm6BLrR1iNYOo5jRr+4FewnCdoZWiQEAAMA2XGFgu9IlvuHksAW6oPYXMj5P0EznuyVBC7LRG60aWtLW5LmSsD9J497SaEO9kRoVTp1W+3pkPHIvV4tt/ZnV0Xb7FMuybq88v0oQAABAn7plZldjjwsPEm4P/q6bPy3poFIOA3H3Y5KmE185KytipJ9/wXTTZMuKVY4tLgdu/8BNe7Rh6dYUng5s1ytxiuNrb1I6OeyuE3X+1V3JV8yCG4r9cQX2ibvvrvP86xJkpl53eb1zgtyStGxmdz8/zvhAFxZuVsy0HLvf2Nze4/+6nmM16ZTXufRuo23G5K/WdX5uV2OLy42fnx1UGJ1s6xLMFDPQ0oeW2V5nXdatvE8IAABAH/rITH8cF/OnHn4FjDclUvanKZOgJxRGL6mUf23bLbLRuDz1ihgfuPQ9FfMXfKtjU6WXg7t+Syl6ELj7CWWjCy1dTraW2B9/9H171yvVQkTK62N/fn85U9+u6BD4b7Vocs7PY2U+nXpj0013vX4/8fUtkvHqeZ/Y6fbu0rdV2tyeNrWpyvCn80o3BGhU2Wi83e2pjjaTfH6V5Y+/n+Z+Mfl0R4o1nc55ee73J3cfIwpbRuY2MQAAAP337qfjcTF/quZGpcU1L10Zl3QtXV6rmu+T5nop5dFdd8VfS/plOC7mT7nruKQPUh1f6s9P7ZaZ3nTTcS/lbeM/cTl/fIv37SMp9/tB5fosTKu0uLbt+ZcXzrjHv5b2+qQSRi8pfY+Pa17MH6h5nUqLa3FxYdpdRyV9tGOFDNfxxJ4G5fyiK/5a2vYUxBZ1IEc71rLzK+UvVO+XFNfBDvbjcq0UM/qW7SUGW0SFlUwAAED/vd9cVDm/mDqhUvxNSXdTbHpg+yR5cljpxv1/4PLfrJXEP5KAmn47ZaI83roY6k0v5TNxMX9KxfylFhYJPnLTb6e+PqXFNS/lj0h+vSXnlTpGfr3yuSmV84vpE+kWFwSkb9cVT9fpVPs1P9DWA6+0mScSr5nbv0t9fuX8orn9u5SJ//F+e/ZRzOhfI4TgUXFsq0QBAAD0kbux3ztb11+UFtfMdDHFltvOsxD4rm+lShBdp1MXMu4r5pdTJmhPVBPE5hJ+s4uJvVoeLRKMpUu87WwjQxdc/ptKV3BKkqaYcbf6efUp5xfN9Mcdbe2mm3XP/VApDKTp7XKgvYee4lqYbsblhTN15TeV7f+DpJVa/7jUd6uaMGdG/xomBFt+NawSAwAA0Eeu110skBRLb5v0QsNvVJZqSPO1enqMPJygWRhNK6H3g0ljTU4TdysuLkw38HdpEt8VlRbON3RUpcU1y06909TcFNnoeXmqngBvern+NiRVhgZZGB1TmyYv3eJ6X23keru0bJ1aQWR7ifeMxXa5ofMr5f/xID786JnRj0ZyewnCNh4fKhAEAADQL8x0o6E/rPQW+LiJrDIxmXep2ckU0/z9gQ58xlYSVwcxt6vNHFjdPW4evQC/nOpz7N4Pm2yDlzvV3jeuWlJne13qQFtKkljwiQPP81RLj2JGP/pkfYwgbGN1/jZBAAAA/aLh5K6i8b91PZXi6P6kuVzc0xQaRjvwGZtV5gtpe5Gg2uNmpeFEzyxl75HGemU8OE/p7Y41eLOfNfR36Yb6PNG24w6PzqTY6uOOrc7TJyhmYJCsEQIAAIAOaTJJlvzd7kyO7dlUiWnT5y+pmYJTqtNvweT4nUzA+zvZvyHUhWJGX15VVjLZxiohAAAAaFI2ej7FVitNf05rigE7lRy3JDE1s7s90ipucWOg42kvIejHi5pqQiYAAACgfu4hQcBDyoQAnc97gQFh6Sb+AQAAQO2XqjRDMzIDHqVBO/8D3BjoNIoZAAAAANJLNzSj+aU60w1n6TyzUkfOX5J73NYigbu3qujyBDdGs+1KuwlCfShm9CF3TRCFR8Xut4kCAABAhzRZjAhi+3KKzTo/V0MxfynVdulWsEjKcJsoZnia+TbGmj7Elpxnn0vTmynVCkHY9IwgBBgY3oLZmgEAACClmOAzkL7S3KtbPJ5is52aqyGxiGKyI019QqUY1HAPj5TL9u5TGJ1sKk+XjXM7JEg70SyFoboMEQIAAAAAdbohabTWBu46JulUg4n8uFwHExNp07LvyOn7DcmSCg2HlY3GG10xxVxfb+oQS1dmFUbnEz9HOuXShYY+I5wclnSY2yGVlaR7xmTjLs02cL88nzgxr1kpda+iHkHPDAAAAAD1pfJSIcVm+4LM1OuNJfKe6u9i6ac7cf7mwXIrz+PRIkF0siVFAtPNFFuNKpw63dju7U8l5npIFStL1Uv8cLVAVEdbmRw219smO1/zn2aLY12IYkZf3iktGPvWjx4fKhAEAACAFijlX1OKoRZu/s+ViSbrSlCy0RuSJfbKkOnmTv3SHNu9H6Z8MT9oYXS1rp1nokmTvt+atEBX023nr9R7nZSZejnVdUKlzcj/IsVmu6sFojqucfAHabZzabnfYkoxox+59hCELazO3yYIAAAArWFmaRLlJ830dtp5GYLs1Jy7Xkj1+bFd3rGTLy2uSX495daHLYyupvrFPZw6baa3JT3ZkgTa4++l3LR6nVL00Agnhy2MLpv5K9wFdagU3lZStOz0BbDM1MuSnkux5cfVAmRfoZgBAAAAoIFE+d5ZSWlWzHjSpB9ZGF3dcoWTcHI4yEy9bmFUdvcTqT7cdDMuL5zZyfN32Vwdmx82C/4yyEZvbFnUCKOXLIwKJv++WlTIkFQtuuhayq2fNPn3LYwKCqOXHvmv2Wg8yEZvmAV/mTKBxiNtRm+kbi+V67B1ETAbjVsYXU1bUDLbwcJfGzEBKAAAAICGEmXLRhfT9qSQdNhchxVGP9CDVUh8j2QjbvVN4+mu13f+/PMXFB6dTj3UwhW69IIpeEFhdKsSg8r5tzeBjr9pCn6u9HNbjJo0qjD6XX3ekyAr1992Wn0L2kx0SgkTgW64Dj9SGL0mqWxmBXf/ezL9rbqWcTWVqoXHvkPPDAAAAAANiYv5U0rVdX6TfdVkbrSRRN7MLqqUv9AN5+9mZyR91MCf7mv0/OtPoBfXzHSxwb+uXif9bVp7q9qMTtXZZvZJGq32WvpHdRUyJLnb96o9dPoOxQwMihVCAAAA0IbkTPEzkj7o0Mddi4sL011z8sX8ssu6/lfvStEp9Rwf6J82845KC+f7NZQUMzAobhMCAACANigtrrnir6n9BY1rXsof6b7zXzjv3pbk9AOZ8q3amct/s03X6Jr44bBb2szD98uxfg4jxYx+s39yjCAAAACgs8nZg4JGW5JaM7vYlYWM+8oLr7Y4Of3ATb9tsv+3y6/Rta6+Lt2svPCqy76txoYpJXlnEK4LxYx+cy/YSxAAAADQcaXFNS/lx8z0ptKtcpLGiruOdtXQklrJqeuopFvN7civu+KvqZhfbt81sovN7spMb1LIaPZ6LJx306RaVWAylVz6Rr/3yLiPYgYAAACAlomL+VOu+EvVhLnRxH6lmpSNqZxf7JmTL+cXvZTPVAs69Z276WblnK+Mt3vCxri4MO2mryj9sq0bXXPTV6qTv6JZxfyyl/JjLn1DjRc1bpnpTff417plctxOYGlWAAAAoMXM7aoCFWpt49LPaiac7suBmZrZR1PHGPvjDS/FWVpci6VpSVJ4dCawYMzdxyQdkPTEVom8XDfMrRAHnm9Fr4S2nl9isSB/StIphdFLJt0/762W41yRdMNNf6Zi/lLHk2jpiLLReCAdr1wfO6DK6hmbEmXJb5hZIZbe3uratCLW7b5e5rqkwD5peP9mPzMl9GiJVW78nslfcOnCputhltlm9ZJbqi7XGsv/QsX8pUFcNteSNgiy0Tl3nRUeast6JS7mz3XdgWWiCTP9hCv0iPe9lJ8gDAD4nuvx7zkAGKjvqKm56pKcNZ7XdrEnhuEArb4/CAEAAAAAdB933524UawykcIgopgBAAAAAN3pQNIGscUUMzCQmDMDAAAAAOoUZKZeV6BMrW1iv3e24ck8w8lhbT3PxmZmP+NqYBBRzAAAAACAOrnF43I7WGubwIK7sdTQqh+B7XrFPXFax1ttWcIV6AEMMwEAAACAOplZIWkbd/2WstF43TvPRJPu/k9TbFngSmBQUcwAAAAAgDrF0k9TbPakuf5ImWgy9Y4z0aSZzkt6MmlTl+iVgYFFMaPflPNLBAEAAABos2L+kqRbKbZ82kxvB9mpueo8GFsLJ4eD7NScmd6W9HSK/d5SKf8aFwKDijkzMCj2EgIAAAC0krnNufl3U2z6pLufMAUnFEYrkm6Y2d37/9Hd/56kv59qKdaNn80lwACjmIFBMUoIAAAA0EpxeeGMZaNjcj1V53vpaIrJPbdnuhmXFs5wBTDIGGYCAAAAAA1yaVrSRx38yI+qnwkMNIoZAAAAANCoYn7ZXcfVmYLGR+46znKsAMUMAAAAAGhOOb/oruMyldr4KZVCRjm/SMABihn9yXSHIGxhJLeXIAAAAKAtyvlF9/jXJF1rw95X3DRJIQP4HMWMfuQqEIQtfLI+RhAAAADQNqXFNS/lj7j0DbWiqGG66bJveyk/xtASYDNWMwEAAACAVirlL7h0QeHkcOC7vuUWj0t2QNK+xL813ZSr4KY/UzF/iWACW6OYAQAAAADtUFpci6XNS6iGR2e23NasRPECSI9iBgZGEGgilpaIBAAAAHZM6cosQQBakN8Rgv5jRsIOAAAAAOhfFDMwOFx7CQIAAAAA9D6KGRgYLo0RBQAAAADofRQz+lAsKxAFAAAAAEC/YgLQfhT7bRlh2MIhQgAAAAB0QDg5LNmzrNKCdqGYAQAAAABojTA6adIpSaOSJJcURn8kadkVf1OlxTWChFZgmEk/KueXCMI29k+OEQQAAACgDTJTL5v0I90vZHzuCUmHTcGPKz02gObRMwOD5V6wlyAAAADUEEYnA7PxWpvE8gsq5pcJFj5vN5PDJv9OwlZPm4I/dOkIAUOzKGb0rxU9WhEdeEGgiVhaIhIAAADbvC+Zjbv7idpbeUESxQxsaDfBd9y1O8Wmh4kWWoFiRv+6TQi2+t7VXoIAAAC6Xnh0ppIg2gHJHiSIsfsNye9K/i5zD6C72O7KBBkp23fpyiwxQzMoZvTro8Rs1d1ZveMhLo0RBQAA0HWy0fPm+g2ZxuR66sG7i1ffYO6/4z34f+28wuiWpIK5FWK790OKG0BrBZmp1xUos+0GsT8el/PHidTOoJjRv2n7KjHYglHMAAAAXSKcHK52zT8m177KK1xde9gn6bCbHzYFLyiMrrvpNeaywA7lH3dTb9ojvTLc/Ii8xtD9SnWRYsYOYTWTPhXHtkoUtnoiaY9GcnsJBAAA2NGX8MzU66bg5+56QaoWMpqzW9Jhc/3UwugyK0ag4/mHx9+TlKagcY1ooSXPUULQt1n7KjHYxifrYwQBAADsiGw0bmFUcPPvSqkmS2zEc6bg5wqjkwQcHVNaXHO37yVs9YEr/ibBQitQzOhXjw8VCMI2jT7QBFEAAAAdl4kmzbWozqw4t9ukHwXZ6A0Cj44pL7zq0jdUWVlxo48lveOKv8bcLmgV5szoV6vztxVGxGFLNkIMAABAR2WmXjbzVzr9se56wcLogJfyR7gI6IhS/oJLFypDnexZmZVUzF8iMGg1ihn97X1JrGjyyJe6jxEFAADQMZlocicKGRscDrJTc3FxYZqLgY6p9MCYJRBoF4aZ9HfafpsYbGmUSUABAEBHZKNxM73d0N+abkpaMbOLZnZR0n+o/rv63wrdTyicOs0FAdAv6JnRx8ys4K5niMQWKpOALhEItFUmNyKtjxCIqseHClqdv00gAAzU+5g0J+nJOv7gpsV2ObZ7P1SxMrfAI6u1hpPDge/6lpsfUR3zb5j8VQ8n/7ztcxZko+eD2L6sQJmN/zr2uCD5ux2dM6E61CGwYGyr/xx7XJDZz7piOdts9LxcvxyYHWjLMYZHZyr7tg0Tz/rd2P1Gx69Lc3Eal2vi4TjtaDvbyRjE/nhczg/k8rAUM/pYLCtYnYuVD4og0ERMMQNtb2f3zrnrBJGovi59ol+SRDEDwOB8D2Sn5tz9qZSb3zW3N+PSwpnEt7fS4losnZF0JshMve7m/1zpCia7TcEfutT6+TPC6KRJxySNy/WEmz9ShTHZCcnOKxvdNOlq7PH32pJwZqNxc83INCbXU5LkvnVUTXZCLimMbkladtNsM0UDC6Oky/cfvZT/1UeOVToi1xNbHeuDY2wkbmF00uTTkh2s7Ft6+MKYTJKdV3j0unmwHJcXzjRx/n8t6Vdqvg/IT6t0Zbaha1ppX/sSr2mD7SzN8dd5zTdf7wfX5eiMyc7X3K/r0sNFiur9Pr0pBiZJOh5kpv6tm/+L5APWT7yY/++berZVjuO7ie9+pq+0s1DIMJN+ZvdWCcI2N5azogk60c58hChsUJ7nmQRgcISTw+7+XMqtP3DFX2okiYzLC2fcdVzSRyn/5LCy0XhLCwdhVDDpR5IOS5WEvPYXpJ5y1wuV5WNbOPSlcixXzfVTSc/dL2SktE/Sc+b6qYXR1ZbGaLNPHiRi2am5B8daZ9yC7NRczW0z0eTn16VSyEiRPBx08+9aGJWbuC6ftPo+2nRNK9cp5YvYxnilXtXnk3Zd7/ozdfv8b8PopIVRuVpA2LfNs+B3VFk1Jiku/6jpd1yL09wfK+3u8UQxo599uFggCNs9qzVGENABFDMAYGBfNYI/kLQ7ZSGjueUqy/nFegoa5nqpNYnm1Okml5rdbfLvWxhdbTqpyUZvVI/lcAvO7LC5ftq2ZW3DyWHLRjfcvdHem7vd/YRloxuVYTRbxMJ0pYnrsq9V16UpmWjSFPy8Bdd0d2VVn6PLW8Wr62WmXq4WC9MUctJcsyeCzNTrDR9PNhpPUyBz6XK7Q0Mxo/+9Twi2vLv2aP8kBQ202zAh4FkEYABVEqY0CdhHbvrtlgy1KOcXzfTHaZP1ZpM6U/Csyb+veuYDqVU8aCJxtjC66q4XWnQsn78uVpa1bXFC73tMwY/r7DWy3fvsU6bgxxuv5YZYaKevS3P3UHSyWpDZ3bqd2kGz4N/31LOkziWd3dKtHpOyZ8V2BYQ083PcUin/WrvDQzGjz5nZKlHYRmwTBAHt+/KJaF8AMKAC3/WtNEmYmf64ld2w42L+lKT/IGkl+R97tslM+r9rcdgON9IToppsH27j5WxxQm8jkp5u4fE9fT9Br8bvcBvO/3JHb6BsNG7S99uyb9dTHT+fhg/Vx+te0rnyPFlJ0Q4PNjqUKs2cO2bWkSIYE4D2e77ucaEyCQ4euclkOWfta7SvhY2ICXg33G8qEA0Ag6Lyq6clbXarWnxo7WeX8v+4Z+PmekHZ6O20BZ7qBKuHO3Bohy2MLnspf6xLs96nLDy67K6DbfqE5xRGJ1XKX+jIO0NlGNSTbfyIjp5PM9e1wWLDZUsxxCiQjsdSfcXUyoo7iccV+72znQgRPTP6/9u0QBC2dYgQoG0P14DJPze/mbCKCYCBeuglJpVmukyctk1kk4XRyQbmnLilz3un/H8NJcA93Oaa+xrXqY6cRqW3wOGUB3VT0jtmdlGmvFL1SOjw+eyEyvCOW4lpYgOrGpnrN1Jsdq1Ty+LSM6PflfNLCiPisO0Dcyqn4sI8gUCrsWLOZnHMkDcAAyI8OpPquSi93WdnvmKm5dj9hkpXZivzONizgQVj7n5E6VehqMznkZAMmelMyg6Qd83snVh+4ZEeH9no+WpylmrVGZNec6kNv+b7dbPgRuxxQZIC2T6XflnSuOpZvaPm/q0Qu9+QpMCDv+vmT0s6qPRzUox2ojdDIB1PcVk/cunbKlaOxR8qhpj76ymKO6PKRuMPtwk3/Z7cww3X/MXq0KAaRQE/XaOhlnbiZjSzq4nFPtdTykbPq5i/VMeuEwsgbnqrU+dJMWMwrKjx2Yz7WuA+EUsUM9AOI4Rg01cbxQwAg/FuYXbAk7Ix0812L1nYQR+57KxKC+c3nXalGDEb3z/lyjwFqYoGge/6Vixtu0xtkJl63d3TdMH/wBV/zYvbFEaK+UsuXaokwPojJc9lsS/ITL3eyBK62x6f67TKVxY3xi5++FzN/7kaGnbh193sjIpXlrfcfzg5HNiuV9L2cDHpWHuKORuO2JVJ3Eb69rZFlWJ+2aVxC48uJxU0gtiiR4ZZPJzYh9F04kGXrsx2vlqhm3Ldrf6vxx/+z7H8gkmJ19Vcv+FSumJGGL2kpCWEK8+2S50KA8NMBoBJS0Rh24dhjiig9WWM3F6xkslmjw8VCAKAAXnzSv6l23Wjb96lXMdVWjifuF0pf8zMLqbaZ8JKCx54mrkr0i95W8wvu+KvSfog+dj8SItCVzm+cn6x1kZxeeFMPcvubnDNS1fGaxbNSotrcXFh2t3Szm8w1oEmdSC5eJDcO8TNzqS4lgd66Fa7a2YX3XTcS3nzYv6Al/Jj1X9+das2Lfn1FPtNPQmoKbntW2wdHT5HMWMAxMybUcswS7Si5T67N0EQHrI6f5sgABgE7nFigmRm5X44VzO7mJSMb3onLS5MV+c5SNrz9jHMRuNpJiCse8nb0uKau06n2HK00VUgNiamqQstUr3L7krSLS/l0xddyguvpkx89zW7pG9LpIl/pYjznxK2+lKP3GofuOIvxcWF6Xp6PbhsLt01jZLnqakMG0sauvNxC3stpUIxYyDsWiIGNW6COJgmCmjtg9XHiMIm7xMCAIPDdg/KmTayYkHKX2731Uhejqf4+2sNDeOpFGauJb87WlMT0pnZO/VOkFhd+eZWqv17qiR2c+KboidDde/PtvXuseQfYc399TRFFS/l/46X8lbjn1/t/seJSnUVvjaq9GC5lfwRyb0zAgu+k+ITr3Y6PBQzBkF5flWmOwRimwcdQ03Q6jbF5J8PR+Q2MQCAjUWAuND7Z+HXG0mwUv9yu02y6p78g4HLG06qLEWPZrfmfrSI5X/R4J8utzTGGxXzy+l6zbT75lCKXkt20Cz4yyAbvdEVPUXayGL742ZWBkm5atLhpDh6uok/ZzsdHyYAHZzsakmyZwjElipDTT5cLBAKtAjL/m76IrWCEwYAeCDwIBP3/LM9uNHws70yeWHCUBF7VtoqObJ08xykXFXm0aTNfyXFZpmmgtfgBInmdsMtMeorDR+XqyDVvi6B2YF2tt3Y7v3QFHw3xbGGLr1gCl5QeLSyWov0dh9NrCu1YNhG7PH3TMELyc+kGpPuZqPnk+9Xv67ilY7HnmLGgHBpySSKGdvdwHEwHUszRAJNy0QTBOGhL1Ixbw8AbH7xaDIZ7o63y7tNvJjebeKDE5cqNdn5Np9849evid4PscVlk7XtpMzsricvxdPeYVSlxTWF0TtKufJN9ZgOuuugSS8ojG5JKri0LMV/0kyvhi5wo0XxvCbpcM1bsjKx7ZbFjOryxQm3tF3diQAxzGRgvjR9iSDUugEZaoJWvQkwX8ajMbm3ShAADJDEBMTde35ejdj9xgBf430N/2VzhZwBeS+P/6VSrCxT49ocNul3TcGqhUeXg8zU6/36LEkVT9NbKTarNbFt0hCTWyrlX9uRFJfbZUB8uFhg3oyahpWdyhEGNJ23y2hHWz1/AGBQvgfM0iSrB4gUsI3S4por/lpr5vCwg27+XQujcq8VNVI+S5IV85fSxDKQnXzkX1ZWOnmi9nHq8k7FiGLGYCVZ80ShRnw8niYKaAHmy9iMlUwADJSUPRZGiRRQQ2lxzYv5A2Z2sUV73Fcpahxd7vdJQ7fMc1KsIuTuRx7NHz2pV8bd2OPv7dR5UcwYpC/XWEtEoeZt/owyuRHigIbRu+fRu8pslSgAGKwHX8r3rcovnuhNtwhBh/KX4sK0m75SLWq0IO520BT8eNAKGrHd+6GUOMRpn7LR858/oyaHJTuY8DfXd3JeEooZA2XXEjFIuCGC9WmigCYeqDmi8NCXZ18sPwgAdaisppCYdJl0jGD1rNuEoLP3VFxcmPZSPuOm45LeaXIIytOm4A8GKoaVgsP1xOeS6+sP3mst+E7S9inn42gbVjMZJOX5VYXRiujauP0N6ZqWdI5IoLH24xNE4ZFvuQJBADCAlpW8GsOowuikSvkLrfzgIBu9kWbFiVj+F40uEbrDPlbCGH4v5Y0m2KeK+UsuVdptNhoPYou8Mvn6eFK7eMhzykbP9+g90OArmV4zr72qSTWOle2TJ/5c2en4UcwYMCYtOcWMWoaVmZpWeWGOUKAu+yfHFGuYQDyknF8iCAAGjZtmzZOXljTTGZdaV8wIo5PuekHy5G1NF3o0vDeU9C6bjcarPWTQz4r55bhSOLx/3Z+v9iw4KCmxoGeurz8ojAxIvFL8sP1EkJl6PQ48L9dTteNnV32HT4lhJgMmDmKS9MQXC58mCqj7YRoHtJtHrRACAIOaZKV6BrqesjC62pLPDCeHTfpOyq1XejXZN0vu8RdIx2mEA3nfXfJS/ogr/pKka8mNafBWFTK3xOeNWzxurpmEzT6Oywtndvp86JkxaD5cLCgb3ZFrD8HY1iFlogl+UUY9nPkytnhH0JITBgCD+73whkk/SrHp4SAbvREX86eae+ban0p6Om1C06vP51j+FyadqBl71zFJ9ccznDodWEKvj9gfj8t5iiVtEGSmXnervXqGuV1NTKJLi2suHbEwKqhWL4SEngf9KC4vnLEwOqWaQ3LsoBLm/TGzy93wDKFnxkAmGCzRmhgjY94M1CETTUgMMXn0fY/5MgAMsFL+guTX02zqrhcsjK42tMJCODlcSdoSVx24/yJ4sxt+UW1YZYx+0gSr+yyMLte132w0bvJX3P1EzX8C/UMad1uN1vonqdjxUMLdmfeQjSuA9IY0vcH21XzHk3fFMDWKGYOYYEjzRCHRoWqCCiQ/SAObJgpb2bVEDAAMMjc7I+mjlJsfNgU/DzJTr6cqaoSTw0E2esMU/Fx1zIfmrtd7Pa5mliYZe64yGWoK4eSwuf5I0pOJnx3bZVp2m3KUwP8qxWaViXNTtXXPdCahtl/vreeSZpvcw/VuGabGMJNBVFyYZ6hJmi9KnXNpgkigppHcXv9sPUcgHrGm8vwqYQAw2O9c+WUPp86a/Psp/2K3m3/XFLyg8OiKmRVi9xubEie3f+Cm/ZIOuidPcviQd1q9esqOJL1+76wpeE4JkzxWe7yMu+nUtslXGJ0006tyhSk++m5s935Iw27b/XJJYfQDJfQKMOn7Hkaq2ZYzUy9LnrRyx60UR1VWQrHQ3U8Emejx2Pz/2CKhKHXdiinF/LLCo9dT9+Z6+Hxlc91yKhQzBjVRl827/ASRqIm5M5Dsk3s5GYXBR7+7jfkyAECSSgvnFUYHlbxU66aihmQH3XXQtHmVUW900VHTTS/mj/VHTBfXLBtdrKzckmjUXD9VNropV8HM7lYSMv87cv19SfuU8gvL3N708uIajbqt7w9X3RNzlCdN+pHC6JRLl2X6v1XMX1I2el6uXzZpPEUhQ5IKKa55wS15X2563mTPb5H5r3Tjiikuu2qVVV/qdaubCqIMMxlQDDVJ+0Bl7gwktRGfIQpbPGNiLREFAKgmDqX8MaVZXaF9PnCP/0lffc8U86fSzklSzd6ekvTc/bkv5PqqEnoAPLSD6z0910ivXFe/d1amUsrNR036XXO9bWHk5nrbpN+VdDhdk1DikKE48HxfBrqUf03peqZsfu/17umVIVHMGFzFhXmZ7hCIRMydge1V2sYogdjKriViAAAbEqdS/oikd3bgoz9wxV9Tqf96FLj8NyV90JkY+m/SijuRZC+uuevlDnzSSqoeBsX8cl1Fsx6Scu6ZjbpumBXFjAHGqiZpb/RmJ8lB/7YNemVsg/kyAGCr5LuUP+ZuZ5V+UtBmXevXQsaDxFfx19TegsYHfR3Drryu+QvV+6Rd7rriZ1Lft/VN5NszGliR5Hq33QcUMwZYbPdI0tMZVWZqmjBgk0xuRLJnCMSjjGFsALC98sKrbpqUtNLeZM2+7aX8kb5Pwh8UNNry6/kKhYwdvE9k325DEeGuu56v65oW88vu9m/6LsaVSXFTD39z02vddgoUMwbZh4sFSTyc0yRngc9qJLeXSODBwzO4d44obC02WyIKAJCQHJXyYy59Q60tanxsZhdd8ZdUWjg/MPEsLa556cq4uf2+pLutSHjN9KaX8mMUMnbyui6cb23hz6+74i+pnF+s+0/LC6+69I065vPoCWnmDala6ZblWDe9j3OXDHiSbpojCqnu9D3Bp+skr6jI5EZSzLQ9uL64a4kgAECaZC1/wUv5MTcdV2U+jVuN7civm9vveym/Oy4uTA9qAh6XF8644i+Z6c0GY/mgGFSZYBQ7blPhr+HeNysufcNLV8abujdK+Qvu8a+Z6U2ZbvbLMyhVzuh1z6/RESzNOuDieGjObP0skUjxmiC9qEw0z1KtCIJ755x1R7e7U97T6vxt4gAAdSVslx4s35iNxoPYIgXKuMcHJNv9SGJhVpD8bux+Q6Urs9X3lNa9H7ovB2ZJ70U/a3T/5nZVQe1lMRvef2lxLZZOSTqlbPR8IH3F3ceqcTwg6YmNSe79eMYeF1S6MttsHM11SYF9sn1wVW74M8x+ZrKLtS9e4/tPc91j9+Udubal/AWXLiicHA5817fc/ED1ema0eVWaW5LKksrmVogDz7e0R8Hn7UsKJ4cle1aSAgvG6roeKa5lUqxb8k6bmXrdk58et7p1JZ/ElaqDbHTOXSS7j7Q/vRIX8+f64lzCo/OM/U9txUv5McIwwDK5EbP1vyEQ272g+On7L9a9gu+5/v+eAwAAW3zXZ6Mb1WWLa7wP2MW4uDDdle9wXEK4BXNEIbXRIBvxcj/QCd4vZolCrQfKF+YJAgAAQJcLo5NJhQypoVVPOoZiBqTiwryYCDR9ruY6q/2TY0RiAGWiCXox1bTCkqwAAADdz6RjKTa71o0Tf95HMQOVxsxEoPXFKw7mWN1kIO+TWaKwPZfzHAEAAOh22Whc0uHkd7vUq53sCIoZkCTFXxwiSavPKKubDJjw6IykUQJR6xuPISYAAADdLpCdTNzIdDPtaic7dx6AJK3O3zZLmB0Zm/M26UVlp3JEYgBkciNmdo5A1MQQEwAAgF7IY9wTh5hYbJe7/TwoZuCB2O7NEoX6mHyO+TMG4Drb+pxce4hEjS9FhpgAAAB0vSAz9bo2L1G8lbux3fth158LlxMPfLhYkPQ+gagrg9vD/Bl9rjK85BCBSLoXGGICAADQ9a9s5tMpNrum0mLXLxBBMQObG7frHFGo26h9+os5wtCHGF6S9snxHkNMAAAAulwYnZS0L/HNrkcmvaeYgc3K+SWxTGsD7JkgjGaJQ59dVVufZ3hJMvdgnigAAAB0+butUvXKWOnm5Vg3opiBLRITfoluKG7Si8pMTROJ/lAtTrF6SfK34h09vmueQAAAAHSxbDQu2cEUOc3lXjklihl4VHlhTvTOaCyvM3+LFU76QGZq2qUXCUSKNi+b1+r8bSIBAADQxe9srpkUm91SKf9ar5wTxQxsid4ZzSR3rHDS0/ZPjlngswQiHVZBAgAA6HLh5LCkw4l5jNnVXjotihnYGr0zGufaYx4sUdDoQSO5vebBEvNkpLZSXQUJAAAA3Zr0+65vSdqdtF3s98721HlxabFtTk7vjCaCR0Gj54zk9tqn6xQy6ntGzBIFAACALn9n66PlWDca4tJiW+WFOYXROUnDBKORp4b2mIIl3z85wa/XXe5+IYMJP9Mz3VFpYY5AAAAAdLFsNG5KHj4Syy/02qlRzEDtfNxsxtzfJRKNBrBa0MhOTau4ME9AujQv/3R9XhQy6ouZNOuEAQAAoLsV88uxtNyPp8YwEyQ0/oV5Se8TiCa49pj7uyzb2oVGcnuD7NScpEMEoz7xF4dmiQIAAAB2CsUMJOfirnNEoXlm/laQjYhlt6gOLXH3EwSj3rZsF1mOFQAAADuJYgaSlfNLkr9HIJrnrrMWHp3XSG4v0dhBzJHRlDjedY4oAAAAYCdRzEDKJPwLM0ShVewZ+3SdlU52yv7JMQoZTbRes4sqz68SCQAAAOwkihlIpzy/aqZXCETLjJoHS8yj0WGZaMI8WBKFjIbFdm+WKAAAAGCnUcxA+iSmMuHfGpFoEdceM3+LYScdEh6dMdNP5NpDMBr2PssMAwAAoBtQzEB6q/O33WyGQLSaPWOfra8qO5UjFm0wkttr4dF5k50nGM1hMmAAAAB0C4oZqA9LtbYpS6ws30ovjRbLRBP22fqqZM8QjOZU5srILxEJAAAAdIMhQoC6824fmjZb/xsi0ZaU8Rn7bH3Vw6PnVLoySzwaNJLbG3y6fs6lF+WEoxVYwQQA0ApBZup1Bcps/4Xjj8fl/HEiBSAJxQzUrzy/atnoFXedJRht4NpjsvMKoxk3m6n2hkFa2amcfbY+52JujFYxs4teYgUTAEALXnPMj8hrTMRtkiSKGQASMcwEDYmL+XOSVohEWw1Xhp5ES8pEE4QjQSaasDBaMvd3meSzhUx36JUBAACAbkPPDDTMg3ja4uCviETbHTLTTxRG77vZLD01HpLJjQTBvXPufoJgtJ5Js17u714ZcWyrZs5cQI885PV3g2x0jkCg7fdg5QeS/nt+htFfS/qV2reZn2ZYKdCEbDQeyE7WfsioHJcXzhCs/kMxA437cLHAcJOOOmTuhxRGa+52To/vmtfq/O2Bjcb+ybHAd824r59w5sVol7Xqksz9rbww59Icl/shYbQk1z8jEOiAc316Xp9waYE2c/+HLtX+Qcu0IoliRh9imAmawnCTHTFs5m/ZZ+urQXZqTvsnxwbq7LNTOQujJYuDv6I3RrvfD+zcQBfMAAAA0LXomYHmEx6Gm+xQ4LXH5SfMgxMKozWT5uMgntOHi4W+O9dMbiSw9RmXcnIf5uJ3xPsqL8wRBgAAAHQjihloHsNNusGwSy9aHLz4oLDhmlc5v9SzZ5TJjch+kTPZtLQ+ykiSzvIgniEKAAAA6FYUM9AScTF/zsJoQtIhorHjKoUN04sKI0n+npkV4lhLXV3cGMnt1Wf3JgL3CZdy0vrw/fXZ0FlmesX7sYcPAAAA+gbFDLSM+9C0BesFlsXsutT0GXc9Y6azleKG3jez1djjgtwKenyosCPzImSiCZmPBRaMufuYPl0flSR6YOy4wZj0EwAAAD2NYgZapzy/6tmpaZO/SzC62iF3P2SyEzJJn67rfpFDksy0JEmxrKDYb1cfFauqZ3nO/ZNjuhfsrfwPGwkCH5FsxN1HJI1Iqs57YXKWIukq7ppm0k8AAAB0O4oZaK3iwryF0Q9cepFg9JxD1WT2kCSZfMMojwcFj3RibfhbV6VeQdGi25n0A+/leVYAALWFk8NS8M8CswPunpGUqf6XG2Z2N3a/IcV/otLiWvcevz1b7dW5W9KB6n8pm1k5dr8h05KK+eWOHVM2GpdrohrTDcfkd82CG5JX4lq6MtsVMcxG40FskYLKtY/lFxqOV3h0ZrtroVjlOPB8R6/FjrbNSiwq79LxAcl2P3JvdbptpngOVN/by3F5oSeXrqWYgZaLS/mZ6vwZo0QD6Blr8WND5wgDAPSfIDP1upsfuf9utkWvyFF3r/4OEfyuwqPXXTanUv7Cxo0sjBJ/mfBSvvUTXoXRSZOOSTqcePwuKRvdtNguty1By0bj5pqRNC7Xvq2PyeTuByv/l0lhdF7y6+bBcrPHleI6/Ecv5X91izYwLdc+N9/wG5MXJC23+lrIJHN9d7trYWH015J+pWZbkp9+pAgUHp0x2fk6QzZaK2Zbfk7q+yoel+zg5ljY9m0zjG6Z2dWmikiSgkz0tpueryt+mWjSTL/zyLUzrUg6Y+HR5fvnUrP9uf1+0204G/1vcn219sNERS/n91PMQMf5Y0MT9tn6KvNnAD1yzzK8BAD6TxidNNMZd3+qzlTjoEkHFUan3HRqx35NDieHTfankg7W9Xeup9z8uxZG0y699HBRpskixkvySjLYQAp30M0PWhhNm9tcG38N/2RTAhvo39bfBrY6d3+94WuRjY55rN9ROb/4yDH2mPuFIZfva2Cy+n3ufsKkEwqja674mw31hArsE9UxVNvC6LKk52peKrP/xTz5+lYKOM3d14mFDEkm+5OkMwx4yqMtVudve6wcgQC6n0k/EMNLAKCvBNmpOZN+JFczSeyouRYVRic7fgKZaNIU/DzNL8W1EkeTflRN5Jo8nqmXzbUoNVrIeCihrRRbCpUu/20STp0209tNtoHKflyLTV0L11NmuqLM1Ms9e1Nlo3ELo4Kbf1eq9Mhp0mFT8HOFU6fb1wYmhy0b3UgqZEiSivlLMt1M8eZ4UNmo4YJG4Lu+lWKzu7Hd+2HivnjUo23K+SWXnyYQQFdbiUv5GcIAAP3Dwuiqu59o0e6eNOlHHU1CK93h35a0u0V7fM7C6Goz8TTzVyQ92eIzHTUFP1cmmmxLDOXfb/qYM1Mvt2Q/92Np/kpLikudlokmq8WsVg+j323y77crJmbBv6+nmGWxpTqOQDre6DF54MdSbHYtTY8Vihlor9KVWTO7SCCAbnzb1R0P4mkCAQB99GivJEWHW75f83/VsXMwXWpD4eBwIwWN6t8cbuPp7jbT260taPieagybE06drhZxWu05Sb/cMzdVZbjWlTa0yU0xaabgtvVrnp2pt1dOdejTx4ktzHWsoYOqTJibeExumk2zO4oZaLu4uDAtaYVIAN3FY5vRh4sFIgEAfaLSXf25Nu39yQ6eye427fdwkI3eSJ0MtqkwtFVszfR2M133HzrykaZjmI3GTW0pZNz3n/XEPZWJJk36foc+7XCQnZpr4f4aHQpzNdW+s9HzdbfMysS5SVbSztNDMQOdSZoeG5qQtEYkgO5gZhdVXpgjEgDQJ8LJYZO/SiAS3kldv5WqaNDewtBWnjSpa76XzfWGOlvA6s57ynS+k3Fw9xM7MkfNxmNI2SvCXL/RwO4T7z2XUg+5YTUTdMbq/G3fP5kzD5ZY4QTYcSvxF3fNEAYA6B+B7XrF3ev5Nf6upOsuLUt+98F+3P5bN02oNRMcttItScsuf/CLbSDb59KXVVlhI+25P2mul1w6UjuJ9e8o7WIRppJc/7vLl2X2M3n8nyR7NjA74NKR1F39XU8F2am5aq/mHUzip05LXufcENVlZy0ub2hL/8BN/41aOs+Ev+ubQm+HpKRFB3zVpR/U2meNe+rphmJQujKr8OiMZLutksCn7uFj0msuXdix61/MLyuMVlJctyP1tavopRTPlVsq5V+jmIHu8+FiwTNRzkw/IRjADjHd8XgoxzKsANBHwslhd6+nF8E7rvhfbjXBXnw/kassP/mC2jfkI62PzPTHcTF/artjVTg5XE080056eljZaHy7ruzVfYWpvlbNLsZ+7+wWsZyNNxQHqkM2En/hd/fnFE6ebWi5zmQfS7rx0AmUHj0nf0HpV/1cqSzfe2XZt70+lSWCm15VRVI1LrMP4hUelckSihl2R6X8bF2fk43G3f2fptz6A3edVvnK4qYYlK7MSqqE8sHStqlWhNkXZKZeb9vSvaabct3d8L//0yObuF11SyxoPaEweilt8cFS9Mow02Wv41QoZqCzyvklz0x93czfIhhA53msnMrzq0QCAPpHYMF33NMVHdztrMoLicNR4vLCGYWTPzQFP5b09A6d2kfuOu6l/GJSghtL08pM/T9pJ6w010ylV8qWBYVjaWPppeRYqrRw3rPR/2muP0oRy92BBd+JpVOtiqGZ/Xksv5BqHoJs9HwdRYdrXson/zpfyl9w6UIHJlNt3T0lO+nyJ1PFQPE3VU4oPhXzyy6Np42Bm09LamUxY8Wly2kLD3F54YyF0bQSelKY/IhLyfusLEGceN6xx9+r7zoBHS9oLMy529cJBNDhQobb11XOLxEJAOiz53vK7t5mejNNIWNjkcAVf03a8CtuhwsZKicUMja/Y77qbmdTbr31r8SVrvBPtDyWxfyyu05L+ij5+7rBlSIe9YG7jsfFhem0EyqmnwfBr6cqZGz8i1L+iEw3e+OdyY+kiq/ib9bTi6YSM7+eYtN91bbYNDO96aX8WD3DNyp/ZykmArWD1UJF7aKD7/pWio+8Vm+PJIoZ2LGCBku2Ap3DhJ8A0KfCyeGUv6SvbDVUI11Bw17ege+tP6+rkLGhoJE6WdxiNYY0XeEl3WooluX8opn9eaPHVn9CrtN1x9A0lmKruy7/zYaOSZru+nuqEvt9Kc7le40MB6rG7m7ypUh1LRLf/xpqq5Jieap5O9IUKtySi0NuqrvnPsUM7Ji4uDBNQQPoBH9vxycTAwC0K+1/NmUS+UbDH1FaON/hX9Q/buZ7y81Sdc8PYvvyFv86MYE0t7mG33/93tk0iWwgfaXJGF5rqBiUojBmZu80PKdHpYfItW6+owLZryffdrqpUr6xSTorsbuW4jPGmjyVu9X2psavVXJh0IOEYVmV1YNGE+NZzF+q/1oBO4iCBtB2K/7YF6YJAwD0p8CCNAnPrYYTrwe5hq528LSa+6xifjlV8SVQZtP/rnSXT/xFPrZ7P2z42EqLa5KvJCaIrgPNhMDl9ccwPDqT6v095S/22x5bA7/Ad5J7fCD5frDlJq/PcoqNmp0w9XqzE8m6Ugw1cT1Va7njQJa41KzFdrmR46OYgR1HQQNomzV/bGiClUsAYOAVmn5fk37asWQyTaLXgmTT3cce+qtnU+z4ZrMJollwI8VmmaYCUF1Jo+Uqv6A3d30a+AW+syxxMt3Y40JHrk8Tw43MrNx0KCrzbNxK/CzXTI37LGmIyceNrtxCMQNdgYIG0PKXjTsexCzBCgB9LtWvyK1IajqZgJr9rOl3S/cb7Ql485OhNp0IJ7vVyB+l6uXjLZsMdqWLb6sUvWL83Y5cp5RLBLeznZkpTa+J7SbUPank3k4N98SimIGuQUEDaNVLoO64xRP6cLFAMACg7x/6KX5FblNi3y7N/vJfyQLbtQJLp2LZzDCTcttam9kgvFskrmbTbO+cdl+nluZo6ZZL3VctXDz0Spq8Mo+bZhs9NooZ6K6bhYIG0ORbBoUMAAAAtEjKCUsfKVxU5qA5WPuv/HozxUuKGeg6FDSABlHIAIABlNwDITA70FOnVEmCmv1S3N2mo+tULLuyN82j84wMqJa00SbnRenkdVeqoSYHN8alumTr7tr7bXxlIIliBroUBQ2g3nc2ChkAMJCP/xSTSbp780lTjdUK2nBWzza7h3QFnLYNRWnBse3A+3eaORZMrSoSdXOBbaUTbVQpVs7pGqX8hRQrBO2uFjAqd5clTvzZ9CpLFDPQtShoAGnf+ShkAABqGms6AY8t6lyyHzR9vC5PLL48UghKN/HoaNPHlm7Z1e6cTyFhGc5UKn//RC/fUE0XpFIug9u2VWkaed1MsXyqWzy+4RqP1r7/dLnp68CzHd0sLi5Mu9vXiQSw3TcBhQwAGOh3pXQrFmw5OV9dOWzyr6yty5e9yc/KRuNyPZUcvIcKBpWx+x8nJ6LRS40nsWnmEZDMdmCYScrEOZA11Zaa/fu2v1qlmOS02eE2JktTELrVTXGJ7d4PpaTVbOygstF4imt8N+XEogltCeh25YU5ChrAlt+EFDIAYOClWyLSpFONJ+DRSbWgR0Id9gWZqdcb/np0T/W3ceD5LeJZSBHLY40eW2DBd6TkoRqx9NMdere4mdji3J9reM6IcHLY3Z/r5jsq3eo/laS90RhIOpxiy+56v6tMBHo9RYHheIqC5PVWrAhDMQO9obww50H8ZZnuEAxAFDIAAJ8nGCkSUEmjQTZ6o5HEy6TvdPq03PyFhhLmcOq0ZAdTbHlrq1UUUi49OtpQT5dsNO6u30p5bJd2pD15qgR6t8n+tLHXF/tTSbu7+57Kv6YUPXTSFs0ajYFLy90WGje9lbiN67eVMB9Imv2kQTEDvePDxYJbPKFUk/IAfW3Fvzg0QiEDAFBJjnQ1VSLiekGZqZfTFwYmh6uJ19M7cFq7TcGP6ypoZKJJk7+ScustE8W0Xd9N+r4y0WRdsXT9kaQnE/dtdnWn2pKb/ixlqztoYVTXcVa2T1Vo6gbLaWIQZKfm6tprZurl1MW2SlGlu1SKbEm52ONJ77GtKtZRzEBv+XCx4I8NTUh6n2BgQK34Y0MTWp2/TSgAABsS8FQrc5j5K6kSsEw0aQp+vMPJ59NmwV+m6QURZKM3zHQlTbGgmrTPbvkfKl3fr6XYxZNmejtVD40HsUxVFLob+72zO5qspuvpI0mHLTy6nFhwCieHLTy6rHRDK9phtN4hIWl7Drj7CQujq+liEF02S1ds28mCVuKxeXPH1uzfbzTE4x89Z3X+tksTQRjNuvQiAcGgMLOLcXFhmkgAAB5OwC079Y67n6gjATtipsux9NMHv5KGk8NS8M9MGt/BxPOhg1Vo0o8URqfM7WoceP7B8JBs9HwgfcVdx9zrWuby2lZDTDYksq+Zpzr/J+8fm0uXpfhPHswD0GAszewdLzY/l0BT7xuxXXbz76bc+qDJfq4wuuby5U2TiIZHZ0x2RJUJT9sztKR0ZVZhdD45gdZfWCb6X2Pz/2uLK/7uI/M3FPOXFB79FymLeYfNgr+0bPTnsfT2praVjZ4PZL9enSckXQxMpR0taCWIywtnLIxOqbEVaT6OywtnKGZg4MWl/IwyUwULfFauPUQE/V3I0CtxceEckQCAPnq2Sy8qjKbrzu9Nv/dwN+3Y7501BekTJmmfu14w6QWF0ds9EK5RNx8113cVRvcLHfL69/ORm2p33y/mly07dTFtcUjSqEmjUvC7D46tsQZxsxt+tKgmq0eUftLX3ZKeM9lzaQoLbbiRbqZYvWa3m/5Hkz16P1X+v9lH7zM7Y65Fpent4wpdD+6nTTv3Olupu15uxeSYbXZVUt0TuZrZZW/hQTDMBL2tvDBXnUdjjWCgT99077jZs3ExTyEDAPrvIT9STRjr+8c9fGRXpcU1l71MTJOSKf1xrV4ZDxL64sJ0HcMtWuEjj/U73RInd/3Pkj7qiYvqbVr1o5hfdrd/0+GzeUel/IWuD/l2w7SS7it5S8+NYgZ6X2UejTHJ3yMY6DMrbvGEigvzhAIAkKi0cF7p5nsYVNfiYj71ErXu8T+R9EFn8nF9W+X8YtdEqpxf3IFEvqOJdbo4LLwq6Z1OtU8v5Y/1xJ1UKQjWuyjDtTSFxHpQzEB/WJ2/7aUrOZefZvlW9Ad/zx8bYulVAEB93x6l/BG1oaDhbh0bw9+WzzLddMXfrOtvSotrrvhram9B4yOXvtGVv8aXF15t03W/plauTljML5vZxTbeU8fU/oLGteq92zvPGulyO7dPg2IG+kvpyizLt6LnX0Tlp710JceKJQCABpOvI61MvtztbPUX6l5Noq95MX+goXkIHhQ0/HrLz9N0013Hu3pYQTuuRRuS9upcI9faeE8dq8ah1UNvPjLTm71WyKjcG/nXJN1KufWtdrRzihnoPx8uFryUHzPpBwQDPWbNg/jLm2YCBwCg0eRL9m2lXLK1RrJ9tKOFjE1JtI7WkSxt5W5LEsXS4pqXroxX43mrBWd318wuejF/oKuGliRdi+bmELnrsm+3M2n3Uv5IO3toqLzwqpsmW1fY8utumqxn6FO3SbuErLnNtePzKWagb8Wl/Iy7viomB0VvvHa+548NjTGsBADQMqWF8674S9UEr54k/Ja5/f6OJ9vl/KKX8hlz+/06j/9jM7voir/U0kSxtHD+wfE0ktibbprpzcpx9dhS6+X8ohfzBxo49wfXojqnS3vf/4sL0276ipldbMsErsX8speujLvpuCo9QT6ucw8fS7rmpuNeujLe6jkkOp5vud9Isdnd2O79sB2fz9Ks6G/l/JKP5MaCT9fPufQiAUHXMd3x2GZUzs8RDADoH276vS1XHWnN3t9Nn4AvrsVSJXHORs8Hsl93jw9I9tASrn7XLLgRy/9CxfylrZZPdPnpnYhLXF44I+lM7eOXzKwQe1xQ6cqst/Habjie8SC2yM0PSDqwzeY3zO1GHHhexfxyK44r8TqYlTpw7s8H0lfcdUBSZutr4TdUyr/mDbeDOtr5QwWHWPq8SBAenWn551TukUv39x9YMLZdu3xwb1XbZkuug/yC5IW2xK+u11g/oi2Wu33I9XYtNZv4yUE2Oueujk340zP5h+kVlkrsMZlowiqzHY8SDHSJ992HplWeXyUU6LrvuTBaknSISKDtSX8pb0QBAHpMNho3108Tn/Gmr7SrBwrDTDA4yvklL+XHzPQKK55gZ7NE3alM8pmfoJABAACAnnuddc2k2GylnUNpKGZg4MTF/DmPh8Ykf49ooPP8PY+HxpjkEwAAAD0pnByWdDhpM/N0E4Q2imIGBlN5ftVLV3LVCUJZxhWdsOZmz3rpSo7eGAAAAOhVge/6lqTdCZvdqs6x0r7j4FJgoFWHnrjb1xl6gnYx0yv+2NCYigvzRAMAAAC9zM2nk99/29srQ6KYAVSUF+b8i0MjzKeBFj/q33Mf+qW4mD+n1fnbxAMAAAA9LYxekrQvabPKiivtRTEDuG91/nZczJ+jqIEWeN9dX2VICQAAAPqJScdSbHatnRN/3kcxA3gYRQ00rjovRn5C5fwS4QAAAEDfyEbjkkaTNnPpcicOh2IGsB2KGkhvzd2+7qX8CPNiAAAAoB+Z66XkjXRTpfyFThwPxQwgycNFDWmNoKDq8yJGeWGOcAAAAKAvVZZjPZi0mcV2uVOHNMRVAVJanb8dS+cknVNmatoqs/geIjAD6X13nWMoCQAAAAZBYMF33BOXY70b270fduyYuCxAA8oLc17KT3gQf9nMLjIEZTCY2UUP4i8zJwYAAAAGiXvKiT9Lix3rxU7PDKAZHy4WYmlaI7m9+uRezsxnlGJSHPSUNTPNxV8cmnWWVwUAAMCACTJTr7s8cTlWN8128rgoZgCtUEly51ya0/7JsSAOpl3KSRomOL3K33ML5lRcmHeCAQAAgEF9KzY/kmKzlU4sx7oRxQyg1Sq9NWYkzSg7lQuknMtzcu0hOF1vxeVzeuwLc6IXBgAAAAZdNnpe3j3LsW6UWMyIYy0FzKyxZVyIAhIVF+Zjab7yIKgWNtwnRI+NblIpYPgX5lWeXyUcQPWlxG0uCJzvOrS/rRECAOjmh/STZnaxdnLsj3s5/1qnD824OsAO2D85FniQc1dOzLGxE953+TwFDAAAAKA3UcwAdlp18tAg0AS9NtpmzcyW4lhLenzXPENIAAAAgN5GMQPoNpnciHRvolrcGBM9Nxp5st2R+5JLSwp8SR8uFggKAAAA0E+v/AC620hurz5ZH6sUNzQh0xiTiT5ixcwKlblsdi0xdAQAAADobxQzgF60ocAh2Yi7j0g6NABPrDtyFUwqxPJVuRVUzi/RIAAAAIDBQjED6CfVIofMxwKzvZVhKra3B3tzvC9JZlqK3W/LraDHhwrMdQEAAABAopgBDJZMbkRaH6nc/ZWChyQ9KHp8bkStnYh0TdLqhgdPQabbkhTLCor9tnbFt5nbAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYOf9/9KJZACC1w2YAAAAAElFTkSuQmCC')),
+    width=184,
 )
 st.sidebar.markdown(
     '<div class="icl-sidebar-product">CHEMICAL MANAGER</div>',
     unsafe_allow_html=True,
-)
-
-st.sidebar.divider()
-
-st.sidebar.markdown(
-    '<div class="icl-account-label">SIGNED IN</div>',
-    unsafe_allow_html=True,
-)
-st.sidebar.markdown(f"**{CURRENT_USER['name']}**")
-st.sidebar.caption(CURRENT_USER["email"])
-st.sidebar.caption(f"Role · {CURRENT_USER['role'].title()}")
-st.sidebar.button(
-    "Log out",
-    key="icl_logout",
-    on_click=st.logout,
-    width="stretch",
 )
 
 st.sidebar.divider()
@@ -5892,70 +4730,75 @@ if st.session_state.get("icl_excel_sub") not in ["Import", "Export"]:
     st.session_state["icl_excel_sub"] = "Import"
 
 
-def _icl_root_button(label, key):
-    active = st.session_state.get("icl_nav_root") == label
-    if st.sidebar.button(
-        label,
-        key=key,
-        type="primary" if active else "secondary",
-        width="stretch",
-    ):
-        st.session_state["icl_nav_root"] = label
+def _icl_nav_item(label, root, sub, key):
+    active = st.session_state.get("icl_nav_root") == root
+    if root == "Inventory":
+        active = active and st.session_state.get("icl_inventory_sub") == sub
+    elif root == "Excel":
+        active = active and st.session_state.get("icl_excel_sub") == sub
+    if st.sidebar.button(label, key=key, type="primary" if active else "secondary", width="stretch"):
+        st.session_state["icl_nav_root"] = root
+        if root == "Inventory":
+            st.session_state["icl_inventory_sub"] = sub
+        elif root == "Excel":
+            st.session_state["icl_excel_sub"] = sub
         st.rerun()
-    return st.session_state.get("icl_nav_root") == label
 
 
-def _icl_child_button(label, state_key, state_value, key):
-    active = st.session_state.get(state_key) == state_value
-    if st.sidebar.button(
-        label,
-        key=key,
-        type="primary" if active else "secondary",
-        width="stretch",
-    ):
-        st.session_state[state_key] = state_value
-        st.rerun()
-    return st.session_state.get(state_key) == state_value
+def _icl_nav_section(title):
+    st.sidebar.markdown('<div class="icl-nav-section">' + title + '</div>', unsafe_allow_html=True)
 
 
-if _icl_root_button("Inventory", "icl_nav_root_inventory"):
-    _icl_child_button(
-        "Chemicals",
-        "icl_inventory_sub",
-        "Chemicals",
-        "icl_nav_inventory_chemicals",
-    )
-    _icl_child_button(
-        "Scan",
-        "icl_inventory_sub",
-        "Scan",
-        "icl_nav_inventory_scan",
-    )
+st.markdown("""
+<style>
+[data-testid="stSidebar"] .icl-nav-section {
+  margin: 24px 0 8px; padding: 0 12px;
+  font-size: 10px; font-weight: 750; letter-spacing: .14em;
+  color: #718096; text-transform: uppercase;
+}
+[data-testid="stSidebar"] button[kind="secondary"] {
+  justify-content: flex-start !important; text-align: left !important;
+  min-height: 40px; border: 1px solid transparent !important;
+  border-radius: 7px !important; padding: 8px 14px !important;
+  color: #475569 !important; background: transparent !important;
+}
+[data-testid="stSidebar"] button[kind="secondary"]:hover {
+  color: #102c57 !important; background: #edf2f8 !important;
+}
+[data-testid="stSidebar"] button[kind="primary"] {
+  justify-content: flex-start !important; text-align: left !important;
+  min-height: 40px; border: 1px solid #d8e3f1 !important;
+  border-left: 3px solid #173d70 !important;
+  border-radius: 7px !important; padding: 8px 12px !important;
+  background: #e9f0fa !important; color: #102c57 !important;
+  font-weight: 650 !important; box-shadow: none !important;
+}
+[data-testid="stSidebar"] button p { text-align: left !important; }
+</style>
+""", unsafe_allow_html=True)
 
-_icl_root_button("Storage", "icl_nav_root_storage")
-
-if _icl_root_button("Excel", "icl_nav_root_excel"):
-    _icl_child_button(
-        "Import",
-        "icl_excel_sub",
-        "Import",
-        "icl_nav_excel_import",
-    )
-    _icl_child_button(
-        "Export",
-        "icl_excel_sub",
-        "Export",
-        "icl_nav_excel_export",
-    )
-
-_icl_root_button("Add Chemical", "icl_nav_root_add")
-_icl_root_button("SDS", "icl_nav_root_sds")
-
+_icl_nav_section("Inventory")
+_icl_nav_item("All chemicals", "Inventory", "Chemicals", "nav_chemicals")
+_icl_nav_item("Add chemical", "Add Chemical", None, "nav_add")
+_icl_nav_section("Storage")
+_icl_nav_item("Storage locations", "Storage", None, "nav_locations")
+_icl_nav_item("Storage scan", "Inventory", "Scan", "nav_scan")
+_icl_nav_section("Data & safety")
+_icl_nav_item("Import Excel", "Excel", "Import", "nav_import")
+_icl_nav_item("Export Excel", "Excel", "Export", "nav_export")
+_icl_nav_item("Safety data sheets", "SDS", None, "nav_sds")
 if CURRENT_USER["role"] == "admin":
-    _icl_root_button("User Management", "icl_nav_root_users")
-    _icl_root_button("Activity Log", "icl_nav_root_activity")
+    _icl_nav_section("Administration")
+    _icl_nav_item("Users", "User Management", None, "nav_users")
+    _icl_nav_item("Activity log", "Activity Log", None, "nav_audit")
+_icl_nav_section("Workspace")
+_icl_nav_item("Settings", "Settings", None, "nav_settings")
 
-_icl_root_button("Settings", "icl_nav_root_settings")
+st.sidebar.divider()
+with st.sidebar.expander("Account · " + str(CURRENT_USER['name'])):
+    st.caption(CURRENT_USER['email'])
+    st.caption("Role: " + CURRENT_USER['role'].title())
+    st.button("Log out", on_click=st.logout, width="stretch", key="nav_logout")
 
 _root_menu = st.session_state["icl_nav_root"]
 
@@ -6427,9 +5270,9 @@ elif menu == "Add Chemical":
             st.session_state.pop(k, None)
     add_ocr_result, active_photos, can_register = _icl_add_photos()
     st.divider()
-    st.markdown('### Bottle details')
+    st.subheader('Bottle details')
     if not can_register:
-        st.info('Confirm an OCR identity and apply it, or switch to Manual entry.')
+        st.info('Review and apply a product, or select Manual entry above.')
 
     defaults = {
         "add_name": "",
@@ -6489,7 +5332,7 @@ elif menu == "Add Chemical":
                 format_func=lambda option: option[2], key="add_storage",
             )
         remaining_amount = st.number_input("Remaining amount", min_value=0.0, key="add_remaining_amount")
-        full_bottle = st.checkbox("Unopened bottle · set remaining amount equal to Amount", value=False)
+        full_bottle = st.checkbox("Unopened bottle · Set remaining amount equal to the amount above", value=False)
         if full_bottle:
             remaining_amount = initial_amount
         with st.expander("More details", expanded=False):
@@ -6505,14 +5348,14 @@ elif menu == "Add Chemical":
                 purity = st.text_input("Purity", key="add_purity")
                 status = st.selectbox("Status", ["Unopened", "In Use", "Disposal Pending"], key="add_status")
             st.date_input("Registration date", value=registration_date, disabled=True, format="YYYY-MM-DD")
-        registration_confirmed = st.checkbox('I reviewed the identity, amount and storage location for this new bottle.', value=False)
-        submitted = st.form_submit_button("Register bottle", type="primary", disabled=not can_register)
+        registration_confirmed = st.checkbox('I checked the name, CAS, amount and storage location. Register this as a new bottle.', value=False)
+        submitted = st.form_submit_button("Register new bottle", type="primary", disabled=not can_register)
 
     if submitted:
         if not can_register or not registration_confirmed:
-            st.error('Review the bottle information and check the confirmation box.')
+            st.error('Review the registration details and select the confirmation checkbox.')
         elif not chemical_name.strip():
-            st.error('Chemical name is required.')
+            st.error('Enter a chemical name.')
         elif remaining_amount > initial_amount:
             st.error('Remaining amount cannot exceed the initial amount.')
         else:
@@ -6531,7 +5374,7 @@ elif menu == "Add Chemical":
             try:
                 bottle_id = _icl_register_new_bottle(values, storage, photos, draft, source_scan_id)
             except Exception as exc:
-                st.error('등록하지 못했습니다: ' + _icl_exception_message(exc))
+                st.error('Registration failed: ' + _icl_exception_message(exc))
             else:
                 for record in st.session_state.get('inventory_scan_batch', []):
                     if record['scan_id'] == source_scan_id:
@@ -6541,16 +5384,16 @@ elif menu == "Add Chemical":
                 st.session_state['icl_add_batch'] = [r for r in st.session_state.get('icl_add_batch', [])
                     if r.get('scan_id') not in completed_hashes]
                 st.session_state.pop('icl_add_group_selected', None)
-                st.session_state['icl_saved_notice'] = f'{chemical_name} · {bottle_id} registered · {len(photos)} photo(s) linked'
+                st.session_state['icl_saved_notice'] = f'{chemical_name} · {bottle_id} registered ({len(photos)} photos attached)'
                 try:
-                    with st.spinner('안전 정보 확인 중…'):
+                    with st.spinner('Checking safety information…'):
                         safety = fetch_pubchem_safety(cas_number, chemical_name)
                     if safety:
                         save_pubchem_safety(int(bottle_id.rsplit('-', 1)[1]), safety)
                     else:
-                        st.session_state['icl_saved_notice'] += ' · Review safety information in SDS.'
+                        st.session_state['icl_saved_notice'] += ' · Please check the safety information in SDS.'
                 except Exception:
-                    st.session_state['icl_saved_notice'] += ' · Safety lookup failed; review SDS.'
+                    st.session_state['icl_saved_notice'] += ' · Safety lookup failed. Please check SDS.'
                 st.session_state['icl_reset_after_save'] = True
                 st.session_state['icl_add_upload_nonce'] = st.session_state.get('icl_add_upload_nonce', 0) + 1
                 st.rerun()
@@ -6948,7 +5791,7 @@ elif menu == "Excel Import":
 # ============================================================
 
 elif menu == "Storage Management":
-    if st.button('사진으로 보관 시약 확인 · Storage Scan', key='storage_open_scan'):
+    if st.button('Open Storage Scan', key='storage_open_scan'):
         st.session_state['_pending_navigation'] = 'Inventory Scan'
         st.rerun()
 
@@ -8831,7 +7674,13 @@ def render_icl_live_test():
     result = saved["result"]
     guard = __import__("icl_ocr_ui_guard")
     guard.render_review(globals(), result)
-    choices = guard.candidates(result)
+    label_fields = result.get('fields') or {}
+    label_codes = {str(x.get('value', '')).strip().upper() for x in label_fields.get('catalog', [])} - {''}
+    choices = [c for c in guard.candidates(result) if c.get('catalog_correction') or not c.get('catalog') or not label_codes or str(c['catalog']).strip().upper() in label_codes]
+    if len(choices) < len(guard.candidates(result)):
+        st.warning('Candidates with a different catalog number were excluded. Rescan to refresh the lookup.')
+    if label_codes:
+        st.caption('Catalog read from label: ' + ' / '.join(sorted(label_codes)))
     if not choices:
         st.warning("확인 가능한 제품 후보가 없습니다. 라벨을 다른 각도에서 촬영하거나 수동 등록하세요.")
     else:
