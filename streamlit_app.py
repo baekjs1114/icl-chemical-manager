@@ -2530,6 +2530,10 @@ def analyze_scan_memory_item(item, enable_pubchem=False):
 
 
 LABEL_VENDOR_ALIASES = {
+    "Aladdin": (
+        "ALADDIN",
+        "ALADIN",
+    ),
     "TCI": (
         "TCI",
         "TOKYO CHEMICAL INDUSTRY",
@@ -2580,6 +2584,7 @@ ADD_CHEMICAL_MANUFACTURERS = [
     "Junsei",
     "DAEJUNG",
     "SAMCHUN",
+    "Aladdin",
 ]
 
 OTHER_MANUFACTURER_OPTION = "Other / Manual input"
@@ -4251,7 +4256,11 @@ def _icl_scan_register_form(record, storage_options, target, scope, prefill, can
         name = st.text_input('Chemical name *', value=clean_text(prefill.get('name')), key=key + '_name')
         a, b = st.columns(2)
         cas = a.text_input('CAS No.', value=clean_text(prefill.get('cas')), key=key + '_cas')
-        manufacturer = b.text_input('Manufacturer', value=(canonical_label_vendor(maker) or maker) if maker else '', key=key + '_maker')
+        maker = (canonical_label_vendor(maker) or maker) if maker else ''
+        makers = list(ADD_CHEMICAL_MANUFACTURERS) + ([maker] if maker and maker not in ADD_CHEMICAL_MANUFACTURERS else []) + [OTHER_MANUFACTURER_OPTION]
+        maker_choice = b.selectbox('Manufacturer', makers, index=makers.index(maker),
+            format_func=lambda v: 'Select manufacturer' if v == '' else v, key=key + '_maker_choice')
+        other_maker = b.text_input('Other manufacturer (when "' + OTHER_MANUFACTURER_OPTION + '" is selected)', key=key + '_maker')
         catalog = a.text_input('Catalog No.', value=clean_text(prefill.get('catalog')), key=key + '_catalog')
         lot = b.text_input('Lot No.', value=clean_text(prefill.get('lot')), key=key + '_lot')
         amount_col, unit_col, remaining_col = st.columns([2, 1, 2])
@@ -4277,6 +4286,7 @@ def _icl_scan_register_form(record, storage_options, target, scope, prefill, can
     if remaining > amount:
         st.error('Remaining amount cannot exceed the amount.')
         return
+    manufacturer = other_maker if maker_choice == OTHER_MANUFACTURER_OPTION else maker_choice
     draft = None
     try:
         if candidate:
