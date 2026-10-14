@@ -3676,8 +3676,12 @@ def _icl_review_product(result, scope):
                     st.caption('Manufacturer product lookup was unavailable (' + ', '.join(dict.fromkeys(str(e.get('status')) for e in denied)) + '). This does not invalidate clear label evidence.')
             if candidate.get('catalog_correction'):
                 st.warning('Suggested catalog correction: ' + ' / '.join(candidate.get('observed_catalogs', [])) + ' → ' + str(candidate.get('catalog')) + '. Open the manufacturer source and check the original label before applying.')
+            # In Storage Scan an existing-inventory candidate is checked again when
+            # the physical Bottle ID is confirmed, so the comparison is pre-ticked.
+            from_inventory = (scope.startswith('scan_') and candidate.get('source') == 'inventory_unreviewed'
+                              and not candidate.get('catalog_correction'))
             acknowledged = st.checkbox('I compared this candidate with the name, CAS and catalog number on the label.',
-                key=key + '_confirm_' + str(candidate.get('candidate_id')))
+                value=from_inventory, key=key + '_confirm_' + str(candidate.get('candidate_id')))
             st.session_state[guard.review_key(result, candidate)] = bool(acknowledged)
     with st.expander('OCR text and lookup evidence'):
         observations = result.get('observations') or []
@@ -4336,7 +4340,7 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
             default_observed, _ = _icl_scan_location_for(bottle, storage_options, target, move)
             observed = st.selectbox('Observed storage location', storage_options,
                 index=storage_options.index(default_observed), format_func=lambda x: x[2], key=key + '_storage')
-            move_here = st.checkbox("Also update the bottle's current storage location", value=move, key=key + '_move')
+            move_here = st.checkbox("Also update the bottle's current storage location", value=True, key=key + '_move')
             unchanged = (observed[0], observed[1]) == (bottle['storage_unit_id'], bottle['shelf_number'])
             move_here = bool(move_here and not unchanged)
             st.write(f"**{bottle['bottle_id']}** · " + (('Move to ' if move_here else 'Observed at ') + observed[2]))
@@ -4466,7 +4470,7 @@ def _icl_scan_review_one(batch, storage_options, target, move):
     default_observed, _ = _icl_scan_location_for(bottle, storage_options, target, move)
     observed = st.selectbox('Observed storage location', storage_options,
         index=storage_options.index(default_observed), format_func=lambda x: x[2], key=key + '_storage')
-    move_here = st.checkbox("Also update the bottle's current storage location", value=move, key=key + '_move')
+    move_here = st.checkbox("Also update the bottle's current storage location", value=True, key=key + '_move')
     unchanged = (observed[0], observed[1]) == (bottle['storage_unit_id'], bottle['shelf_number'])
     move_here = bool(move_here and not unchanged)
     st.write(f"**{bottle['bottle_id']}** · " + (('Move to ' if move_here else 'Observed at ') + observed[2]))
