@@ -683,10 +683,25 @@ class CompatConnection:
         else:
             self._pool.release(self._conn)
 
+    def __del__(self):
+        # Many callers close only on the happy path. An exception, st.rerun()
+        # or st.stop() between get_connection() and close() used to keep the
+        # connection checked out forever; after six of those every user got
+        # queue.Empty at login. Return it when the wrapper is collected.
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 def get_connection():
     pool = _get_db_connection_pool()
-    raw = pool.acquire()
+    try:
+        raw = pool.acquire(timeout=5)
+    except queue.Empty:
+        # Every pooled connection is busy: use a one-off connection rather
+        # than failing the page. It is closed (not pooled) on close().
+        return CompatConnection(pool._create(), pool=None)
     return CompatConnection(raw, pool=pool)
 
 
