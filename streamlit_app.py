@@ -32,7 +32,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 # ============================================================
@@ -3588,6 +3588,14 @@ def _icl_review_ready(result, candidate, acknowledged):
                 and not result.get('conflicts'))
 
 
+def _icl_eligible_candidates(result):
+    """Candidates whose catalog agrees with the label (or that carry an explicit correction)."""
+    guard = __import__('icl_ocr_ui_guard')
+    label_codes = {str(x.get('value', '')).strip().upper() for x in (result.get('fields') or {}).get('catalog', [])} - {''}
+    return [c for c in guard.candidates(result) if c.get('catalog_correction') or not c.get('catalog')
+            or not label_codes or str(c['catalog']).strip().upper() in label_codes]
+
+
 def _icl_review_product(result, scope):
     guard = __import__('icl_ocr_ui_guard')
     if not guard.is_v8(result):
@@ -3605,13 +3613,19 @@ def _icl_review_product(result, scope):
     label_fields = result.get('fields') or {}
     label_codes = {str(x.get('value', '')).strip().upper() for x in label_fields.get('catalog', [])} - {''}
     label_vendors = {str(x.get('value', '')).strip() for x in label_fields.get('manufacturer', [])} - {''}
-    choices = [c for c in guard.candidates(result) if c.get('catalog_correction') or not c.get('catalog') or not label_codes or str(c['catalog']).strip().upper() in label_codes]
+    choices = _icl_eligible_candidates(result)
     if len(choices) < len(guard.candidates(result)):
         st.warning('Candidates with a different catalog number were excluded. Rescan to refresh the lookup.')
     if label_codes:
         st.caption('Catalog read from label: ' + ' / '.join(sorted(label_codes)))
     key = scope + '_' + _icl_result_key(result)
-    selected = st.radio('Select a product', list(range(len(choices))) + [-1], index=None,
+    # When every candidate without a catalog correction is the same chemical
+    # (one CAS), the first one is preselected; the label comparison checkbox
+    # below still has to be ticked before anything is saved.
+    plain = [c for c in choices if not c.get('catalog_correction')]
+    same = {clean_text(c.get('cas')) or normalize_chemical_name(c.get('name')) for c in plain}
+    preselect = choices.index(plain[0]) if plain and len(same) == 1 else None
+    selected = st.radio('Select a product', list(range(len(choices))) + [-1], index=preselect,
         format_func=lambda i: 'None match · Enter manually or retake' if i == -1 else guard.candidate_label(choices[i]),
         key=key + '_candidate')
     candidate = choices[selected] if selected is not None and 0 <= selected < len(choices) else None
@@ -3740,54 +3754,329 @@ def _icl_ocr_connection_panel(scope):
                 st.error('Connection failed: ' + _icl_exception_message(exc))
 
 
-def _icl_storage_scan():
-    st.header('Storage Scan')
-    _icl_ocr_connection_panel('scan')
-    st.caption('Read label → Review product → Identify bottle → Save observation or register')
-    if not get_ocr_api_key():
-        st.error('OCR is not configured. Ask an administrator to set OCR_API_KEY.')
-    uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
-        accept_multiple_files=True, key='icl_scan_uploads')
-    st.caption('Each photo is one review item. To combine multiple views of one bottle, use Add Chemical.')
-    items, warnings = expand_inventory_scan_uploads(uploads)
-    if warnings:
-        with st.expander('Upload notes'):
-            for warning in warnings:
-                st.write(warning)
-    signature = hashlib.sha256('|'.join(i['scan_id'] for i in items).encode()).hexdigest()
-    previous = st.session_state.get('inventory_scan_batch') or []
-    if items and previous and st.session_state.get('icl_scan_upload_signature') != signature:
-        st.info('Your upload list has changed. Analyze photos to update the review queue.')
-    if st.button('Analyze photos', type='primary', disabled=not items or not get_ocr_api_key()):
-        old = {r['scan_id']: r for r in previous}
-        batch = []
-        progress = st.progress(0.0)
-        for index, item in enumerate(items):
-            record = old.get(item['scan_id']) or dict(item)
-            if not record.get('result') and not record.get('saved_observation_id'):
-                try:
-                    with st.spinner(f'{index + 1}/{len(items)} · {item["filename"]} · Analyzing'):
-                        record['result'] = analyze_scan_memory_item(item, enable_pubchem=True)
-                    record.pop('error', None)
-                except Exception as exc:
-                    record['error'] = _icl_exception_message(exc)
-            batch.append(record)
-            progress.progress((index + 1) / len(items))
-        st.session_state['inventory_scan_batch'] = batch
-        st.session_state['icl_scan_upload_signature'] = signature
-        st.session_state.pop('icl_scan_selected', None)
-        st.rerun()
-    batch = st.session_state.get('inventory_scan_batch') or []
-    if not batch:
-        st.info('Upload photos to review product details and link them to your inventory.')
+def _icl_scan_done(record):
+    return bool(record.get('saved_observation_id') or record.get('registered_bottle_id') or record.get('skipped'))
+
+
+def _icl_label_image(image_bytes, result, flip=False):
+    """Crop the detected label from the OCR text boxes and turn it upright.
+
+    Box coordinates come from the EXIF-corrected original. Text direction is
+    the weighted median angle of each box's long edge; vertical text is assumed
+    to read bottom-to-top (the usual way a bottle is held), and ``flip`` turns
+    the result 180 degrees when that guess is wrong. Returns JPEG bytes, or
+    None when there is not enough box evidence.
+    """
+    import math
+    boxes = []
+    for o in (result or {}).get('observations') or []:
+        box = o.get('box') or []
+        if o.get('pass_id') != 'full' or len(box) < 4 or float(o.get('score') or 0) < 0.5:
+            continue
+        if len(str(o.get('text') or '').strip()) < 2:
+            continue
+        boxes.append([(float(x), float(y)) for x, y in box[:4]])
+    if not boxes:
+        return None
+    try:
+        image = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert('RGB')
+    except Exception:
+        return None
+    angles = []
+    for b in boxes:
+        e1 = (b[1][0] - b[0][0], b[1][1] - b[0][1])
+        e2 = (b[2][0] - b[1][0], b[2][1] - b[1][1])
+        dx, dy = e1 if math.hypot(*e1) >= math.hypot(*e2) else e2
+        angle = math.degrees(math.atan2(dy, dx))
+        while angle <= -90:
+            angle += 180
+        while angle > 90:
+            angle -= 180
+        if angle > 45:
+            angle -= 180  # Vertical text: treat as reading bottom-to-top.
+        angles.append((angle, math.hypot(dx, dy)))
+    angles.sort()
+    half, running, angle = sum(w for _, w in angles) / 2, 0.0, angles[0][0]
+    for value, weight in angles:
+        running += weight
+        if running >= half:
+            angle = value
+            break
+    # Group boxes that sit close together (a label is one dense block of
+    # text) and keep the block with the most text area. Stray text on box
+    # flaps or other bottles forms separate, smaller blocks.
+    rects = [(min(p[0] for p in b), min(p[1] for p in b), max(p[0] for p in b), max(p[1] for p in b)) for b in boxes]
+    heights = sorted(min(r[2] - r[0], r[3] - r[1]) for r in rects)
+    gap = max(heights[len(heights) // 2] * 4, max(image.width, image.height) * 0.03)
+    parent = list(range(len(rects)))
+    def _root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for i, r in enumerate(rects):
+        for j in range(i + 1, len(rects)):
+            q = rects[j]
+            if r[0] - gap <= q[2] and q[0] - gap <= r[2] and r[1] - gap <= q[3] and q[1] - gap <= r[3]:
+                parent[_root(i)] = _root(j)
+    areas = {}
+    for i, r in enumerate(rects):
+        areas[_root(i)] = areas.get(_root(i), 0) + (r[2] - r[0]) * (r[3] - r[1])
+    best = max(areas, key=areas.get)
+    kept = [b for i, b in enumerate(boxes) if _root(i) == best]
+    xs = [p[0] for b in kept for p in b]
+    ys = [p[1] for b in kept for p in b]
+    # Generous margin: low-contrast label text often is not detected at all.
+    pad_x = (max(xs) - min(xs)) * 0.25 + image.width * 0.05
+    pad_y = (max(ys) - min(ys)) * 0.25 + image.height * 0.05
+    crop = image.crop((max(0, int(min(xs) - pad_x)), max(0, int(min(ys) - pad_y)),
+                       min(image.width, int(max(xs) + pad_x)), min(image.height, int(max(ys) + pad_y))))
+    if crop.width < 8 or crop.height < 8:
+        return None
+    crop = crop.rotate(angle + (180 if flip else 0), expand=True, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+    if crop.width < 900:
+        scale = min(3.0, 900 / crop.width)
+        crop = crop.resize((int(crop.width * scale), int(crop.height * scale)), Image.LANCZOS)
+    buffer = BytesIO()
+    crop.save(buffer, format='JPEG', quality=88)
+    return buffer.getvalue()
+
+
+def _icl_show_label(record, key, caption_prefix=''):
+    """Show the upright label crop with the original photo behind an expander."""
+    result = record.get('result') or {}
+    flip = bool(record.get('_label_flip'))
+    cache = record.get('_label_view')
+    token = (_icl_result_key(result), flip)
+    if not cache or cache[0] != token:
+        cache = (token, _icl_label_image(record['bytes'], result, flip))
+        record['_label_view'] = cache
+    label = cache[1]
+    caption = caption_prefix + record['filename']
+    if not label:
+        st.image(record['bytes'], caption=caption, width=440)
         return
-    done = sum(bool(r.get('saved_observation_id') or r.get('registered_bottle_id') or r.get('skipped')) for r in batch)
-    st.progress(done / len(batch), text=f'Completed {done} / {len(batch)}')
+    st.image(label, caption='Detected label · ' + caption, width=640)
+    left, right = st.columns([1, 3])
+    if left.button('Flip 180°', key=key + '_flip'):
+        record['_label_flip'] = not flip
+        record.pop('_thumb', None)
+        st.rerun()
+    with right.expander('Original photo'):
+        st.image(record['bytes'], width=440)
+
+
+def _icl_scan_thumbnail(record):
+    # Cached per record; data URLs render directly in st.data_editor image columns.
+    if '_thumb' not in record:
+        try:
+            label = _icl_label_image(record['bytes'], record.get('result'), bool(record.get('_label_flip')))
+            image = Image.open(BytesIO(label or record['bytes']))
+            image = ImageOps.exif_transpose(image).convert('RGB')
+            image.thumbnail((240, 160))
+            buffer = BytesIO()
+            image.save(buffer, format='JPEG', quality=70)
+            record['_thumb'] = 'data:image/jpeg;base64,' + base64.b64encode(buffer.getvalue()).decode()
+        except Exception:
+            record['_thumb'] = None
+    return record['_thumb']
+
+
+def _icl_scan_target_location(storage_options):
+    """Batch-wide location chosen once; individual review uses it as the default."""
+    st.markdown('#### Where were these bottles found or moved to?')
+    labels = [option[2] for option in storage_options]
+    current = st.session_state.get('icl_scan_target_label')
+    target_label = st.selectbox('Location for this batch', labels,
+        index=labels.index(current) if current in labels else None,
+        placeholder="Keep each bottle's current location", key='icl_scan_target_label')
+    target = storage_options[labels.index(target_label)] if target_label in labels else None
+    move = st.checkbox("Also update each bottle's current storage location", value=True,
+        key='icl_scan_target_move', disabled=target is None)
+    return target, bool(target is not None and move)
+
+
+def _icl_scan_location_for(bottle, storage_options, target, move):
+    if target is not None:
+        observed = target
+    else:
+        observed = storage_options[current_location_index(storage_options, bottle['storage_unit_id'], bottle['shelf_number'])]
+    unchanged = (observed[0], observed[1]) == (bottle['storage_unit_id'], bottle['shelf_number'])
+    return observed, bool(move and not unchanged)
+
+
+def _icl_lot_key(value):
+    return re.sub(r'[^A-Z0-9]', '', str(value or '').upper())
+
+
+def _icl_scan_auto_match(record):
+    """Prepare a photo for the quick-confirm table, or say why it needs review.
+
+    Candidates that only differ in name but share one CAS are treated as the
+    same chemical. All non-disposed bottles of that chemical become choices;
+    a Lot number read from the label picks the bottle when it matches exactly
+    one. Cached per OCR result so table reruns do not query the database again.
+    """
+    result = record.get('result') or {}
+    key = _icl_result_key(result)
+    cached = record.get('_auto')
+    if cached and cached.get('key') == key:
+        return cached
+    auto = {'key': key, 'candidate': None, 'bottles': [], 'bottle': None, 'note': '', 'reason': ''}
+    record['_auto'] = auto
+    guard = __import__('icl_ocr_ui_guard')
+    if record.get('error') or not result:
+        auto['reason'] = 'Analysis failed'
+        return auto
+    if not guard.is_v8(result) or not result.get('review_token'):
+        auto['reason'] = 'Analyze again'
+        return auto
+    if result.get('verification_status') == 'CONFLICT' or result.get('conflicts'):
+        auto['reason'] = 'Conflicting label evidence'
+        return auto
+    choices = [c for c in _icl_eligible_candidates(result) if not c.get('catalog_correction')]
+    if not choices:
+        auto['reason'] = 'Catalog correction needs review' if _icl_eligible_candidates(result) else 'No product candidate'
+        return auto
+    identities = {clean_text(c.get('cas')) or normalize_chemical_name(c.get('name')) for c in choices}
+    if len(identities) > 1:
+        auto['reason'] = f'{len(identities)} different chemicals'
+        return auto
+    bottles = {}
+    try:
+        for choice in choices:
+            for bottle in _icl_exact_bottle_matches(choice):
+                bottles.setdefault(bottle['id'], bottle)
+    except Exception as exc:
+        auto['reason'] = 'Inventory lookup failed: ' + _icl_exception_message(exc)
+        return auto
+    bottles = list(bottles.values())
+    if not bottles:
+        auto['reason'] = 'No matching bottle (new bottle?)'
+        return auto
+    names = {normalize_chemical_name(b.get('chemical_name')) for b in bottles}
+    auto['candidate'] = next((c for c in choices if normalize_chemical_name(c.get('name')) in names), choices[0])
+    auto['bottles'] = bottles
+    if len(bottles) == 1:
+        auto['bottle'] = bottles[0]
+        return auto
+    lots = {_icl_lot_key(x.get('value')) for x in (result.get('fields') or {}).get('lot', [])}
+    lots.add(_icl_lot_key((result.get('metadata') or {}).get('lot')))
+    lots.discard('')
+    lot_hits = [b for b in bottles if _icl_lot_key(b.get('lot_number')) in lots]
+    if len(lot_hits) == 1:
+        auto['bottle'] = lot_hits[0]
+        auto['note'] = 'Lot matched'
+    else:
+        auto['note'] = f'{len(bottles)} bottles match · check Bottle ID'
+    return auto
+
+
+def _icl_bottle_option(bottle):
+    return f"{bottle.get('bottle_id')} · {bottle.get('chemical_name')} · {bottle.get('location_text') or 'Not assigned'}"
+
+
+@st.fragment
+def _icl_scan_quick_table(batch, storage_options, target, move):
+    pending = [r for r in batch if not _icl_scan_done(r)]
+    ready = [r for r in pending if _icl_scan_auto_match(r)['candidate']]
+    st.markdown(f'#### Quick confirm · {len(ready)} of {len(pending)} photos')
+    if not ready:
+        st.caption('No photo matched an inventory bottle. Review the photos below one by one.')
+        return
+    st.caption('Check each photo against the Bottle ID, tick the rows that are correct, then save them together. '
+               'When several bottles of the same chemical exist, pick the right Bottle ID in the table. '
+               'Ticking a row confirms that you compared the label with the product and the physical Bottle ID.')
+    select_all = st.checkbox('Select all rows', value=False, key='icl_scan_quick_all')
+    # Fixed picks first, then give same-chemical photos different bottles by default.
+    used = {r['_auto']['bottle']['id'] for r in ready if r['_auto']['bottle']}
+    defaults = {}
+    for record in ready:
+        auto = record['_auto']
+        pick = auto['bottle'] or next((b for b in auto['bottles'] if b['id'] not in used), auto['bottles'][0])
+        used.add(pick['id'])
+        defaults[record['scan_id']] = pick
+    rows, options = [], []
+    for record in ready:
+        auto = record['_auto']
+        pick = defaults[record['scan_id']]
+        observed, will_move = _icl_scan_location_for(pick, storage_options, target, move)
+        for bottle in auto['bottles']:
+            label = _icl_bottle_option(bottle)
+            if label not in options:
+                options.append(label)
+        rows.append({
+            'Save': select_all,
+            'Label': _icl_scan_thumbnail(record),
+            'Chemical': str(auto['candidate'].get('name') or ''),
+            'CAS': str(auto['candidate'].get('cas') or ''),
+            'Bottle': _icl_bottle_option(pick),
+            'Check': auto['note'] or 'One bottle matches',
+            'After saving': (('Move to ' if will_move else 'Observed at ') + observed[2]),
+            'File': record['filename'],
+        })
+    signature = hashlib.sha256('|'.join(r['scan_id'] for r in ready).encode()).hexdigest()[:12]
+    edited = st.data_editor(
+        pd.DataFrame(rows),
+        hide_index=True,
+        disabled=[c for c in rows[0] if c not in ('Save', 'Bottle')],
+        column_config={
+            'Save': st.column_config.CheckboxColumn('Save', width='small'),
+            'Label': st.column_config.ImageColumn('Label', width='medium'),
+            'Bottle': st.column_config.SelectboxColumn('Bottle', options=options, required=True, width='large'),
+        },
+        key=f'icl_scan_quick_{signature}_{select_all}',
+    )
+    chosen = [(ready[i], bottle_label) for i, (flag, bottle_label)
+              in enumerate(zip(edited['Save'].tolist(), edited['Bottle'].tolist())) if flag]
+    if st.button(f'Save {len(chosen)} selected', type='primary', disabled=not chosen, key='icl_scan_quick_save'):
+        seen, saved, failures = {}, 0, []
+        progress = st.progress(0.0)
+        for index, (record, bottle_label) in enumerate(chosen):
+            auto = record['_auto']
+            bottle = next((b for b in auto['bottles'] if _icl_bottle_option(b) == bottle_label), None)
+            if bottle is None:
+                failures.append(f"{record['filename']}: {bottle_label} is not a {auto['candidate'].get('name')} bottle.")
+            elif bottle['id'] in seen:
+                failures.append(f"{record['filename']}: bottle {bottle['bottle_id']} was also chosen for {seen[bottle['id']]}.")
+            else:
+                seen[bottle['id']] = record['filename']
+                observed, will_move = _icl_scan_location_for(bottle, storage_options, target, move)
+                try:
+                    record['saved_observation_id'] = _icl_scan_save(record, auto['candidate'], bottle, observed, will_move)
+                    record['resolved_action'] = 'existing_bottle_observation'
+                    saved += 1
+                except Exception as exc:
+                    failures.append(f"{record['filename']}: {_icl_exception_message(exc)}")
+            progress.progress((index + 1) / len(chosen))
+        st.session_state['icl_scan_notice'] = (saved, failures)
+        remaining = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
+        if remaining:
+            st.session_state['_icl_scan_next'] = remaining[0]
+        st.rerun()
+
+
+@st.fragment
+def _icl_scan_review_one(batch, storage_options, target, move):
+    pending_order = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
+    jump = st.session_state.pop('_icl_scan_next', None)
+    if jump is not None:
+        st.session_state['icl_scan_selected'] = jump
+    if st.session_state.get('icl_scan_selected') not in range(len(batch)):
+        st.session_state['icl_scan_selected'] = pending_order[0] if pending_order else 0
+
+    def advance(current):
+        later = [i for i in pending_order if i > current and i != current]
+        earlier = [i for i in pending_order if i < current]
+        nxt = (later or earlier or [current])[0]
+        st.session_state['_icl_scan_next'] = nxt
+
+    st.markdown('#### Review one photo')
     selected_index = st.selectbox('Photo to review', range(len(batch)), key='icl_scan_selected',
-        format_func=lambda i: f'{i + 1}. {batch[i]["filename"]}' + (' · Complete' if batch[i].get('saved_observation_id') or batch[i].get('registered_bottle_id') or batch[i].get('skipped') else ' · Pending review'))
+        format_func=lambda i: f'{i + 1}. {batch[i]["filename"]}' + (' · Complete' if _icl_scan_done(batch[i]) else ' · Pending review'))
     record = batch[selected_index]
     scope = 'scan_' + record['scan_id']
-    st.image(record['bytes'], caption=record['filename'], width=440)
+    _icl_show_label(record, scope)
     if record.get('saved_observation_id') or record.get('registered_bottle_id'):
         st.success('Saved · ' + str(record.get('registered_bottle_id') or 'Observation linked to the existing bottle.'))
         return
@@ -3805,26 +4094,33 @@ def _icl_storage_scan():
             with st.spinner('Analyzing the original photo again…'):
                 record['result'] = analyze_scan_memory_item(record, enable_pubchem=True)
             record.pop('error', None)
+            record.pop('_auto', None)
         except Exception as exc:
             record['error'] = _icl_exception_message(exc)
         st.rerun()
     if skip.button('Skip this photo', key=scope + '_skip'):
         record['skipped'] = True
+        advance(selected_index)
         st.rerun()
     result = record.get('result') or {}
     if not result or record.get('error'):
         return
+    auto = _icl_scan_auto_match(record)
+    if auto['reason']:
+        st.caption('Needs review · ' + auto['reason'])
     candidate, ready = _icl_review_product(result, scope)
     if not ready:
         st.caption('Select a product and confirm the label match to continue.')
         return
-    action = st.radio('How would you like to handle this bottle?', ['Existing bottle · Add an observation', 'New bottle · Create a Bottle ID'],
-        index=None, key=scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_action')
-    if not action:
-        return
-    storage_options = get_storage_options()
+    matches = _icl_exact_bottle_matches(candidate)
+    action_options = ['Existing bottle · Add an observation', 'New bottle · Create a Bottle ID']
+    action = st.radio('How would you like to handle this bottle?', action_options,
+        index=0 if matches else 1,
+        key=scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_action')
     if action.startswith('New bottle'):
-        location = st.selectbox('Storage location for the new bottle', storage_options, format_func=lambda x: x[2], key=scope + '_new_storage')
+        location = st.selectbox('Storage location for the new bottle', storage_options,
+            index=storage_options.index(target) if target in storage_options else 0,
+            format_func=lambda x: x[2], key=scope + '_new_storage')
         if st.button('Continue to registration', type='primary', key=scope + '_new'):
             _icl_clear_add_identity()
             # Clear an earlier Add Chemical group so it cannot replace this handoff.
@@ -3839,37 +4135,107 @@ def _icl_storage_scan():
             st.session_state['icl_scan_handoff'] = True
             st.session_state['icl_add_mode'] = 'Photo entry'
             st.session_state['icl_previous_add_mode'] = 'Photo entry'
-            st.rerun()
+            st.rerun(scope='app')
         return
-    matches = _icl_exact_bottle_matches(candidate)
     if not matches:
         st.info('No matching inventory records were found. Register a new bottle or check the existing record in Inventory.')
         return
     st.caption('Several bottles may contain the same chemical. Check the physical Bottle ID before linking this photo.')
     mapping = {m['id']: m for m in matches}
-    bottle_id = st.selectbox('Select the physical bottle', list(mapping), index=None,
+    lot_pick = auto.get('bottle') if auto.get('candidate') else None
+    ids = list(mapping)
+    default_index = 0 if len(ids) == 1 else (ids.index(lot_pick['id']) if lot_pick and lot_pick['id'] in mapping else None)
+    if lot_pick and lot_pick['id'] in mapping and len(ids) > 1:
+        st.caption('Lot number on the label matches ' + str(lot_pick['bottle_id']) + '.')
+    bottle_id = st.selectbox('Select the physical bottle', ids, index=default_index,
         format_func=lambda i: f'{mapping[i]["bottle_id"]} · {mapping[i]["chemical_name"]} · {mapping[i]["location_text"] or "Not assigned"}',
         key=scope + '_' + candidate['candidate_id'] + '_bottle')
     if bottle_id is None:
         return
     bottle = mapping[bottle_id]
     key = scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_' + str(bottle_id)
+    default_observed, _ = _icl_scan_location_for(bottle, storage_options, target, move)
     observed = st.selectbox('Observed storage location', storage_options,
-        index=current_location_index(storage_options, bottle['storage_unit_id'], bottle['shelf_number']),
-        format_func=lambda x: x[2], key=key + '_storage')
-    move = st.checkbox('Also update the bottle\'s current storage location', value=False, key=key + '_move')
-    st.write('Bottle to link: **' + str(bottle['bottle_id']) + '**')
-    st.write(('Update location to: ' if move else 'Record observation at: ') + observed[2])
-    confirm = st.checkbox('I checked the physical Bottle ID and the action shown above.',
-        key=key + '_' + hashlib.sha256(repr((observed, move)).encode()).hexdigest()[:12] + '_save_confirm')
-    if st.button('Save observation', type='primary', disabled=not confirm, key=key + '_save'):
+        index=storage_options.index(default_observed), format_func=lambda x: x[2], key=key + '_storage')
+    move_here = st.checkbox("Also update the bottle's current storage location", value=move, key=key + '_move')
+    unchanged = (observed[0], observed[1]) == (bottle['storage_unit_id'], bottle['shelf_number'])
+    move_here = bool(move_here and not unchanged)
+    st.write(f"**{bottle['bottle_id']}** · " + (('Move to ' if move_here else 'Observed at ') + observed[2]))
+    if st.button('Confirm Bottle ID and save', type='primary', key=key + '_save'):
         try:
-            record['saved_observation_id'] = _icl_scan_save(record, candidate, bottle, observed, move)
+            record['saved_observation_id'] = _icl_scan_save(record, candidate, bottle, observed, move_here)
             record['resolved_action'] = 'existing_bottle_observation'
         except Exception as exc:
             st.error('Could not save: ' + _icl_exception_message(exc))
         else:
-            st.rerun()
+            st.session_state['icl_scan_notice'] = (1, [])
+            advance(selected_index)
+            st.rerun(scope='app')
+
+
+def _icl_scan_analyze(items, previous):
+    """Analyze photos concurrently; the OCR request helper never touches session state."""
+    old = {r['scan_id']: r for r in previous}
+    batch = [old.get(item['scan_id']) or dict(item) for item in items]
+    todo = [r for r in batch if not r.get('result') and not r.get('saved_observation_id')]
+    progress = st.progress(0.0, text=f'Analyzing 0 / {len(todo)}')
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_ocr_api_request_bytes, r['filename'], r['bytes'],
+                                   r.get('mime') or 'application/octet-stream', True): r for r in todo}
+        for done, future in enumerate(as_completed(futures), start=1):
+            record = futures[future]
+            try:
+                record['result'] = future.result()
+                record.pop('error', None)
+                record.pop('_auto', None)
+            except Exception as exc:
+                record['error'] = _icl_exception_message(exc)
+            progress.progress(done / len(todo), text=f'Analyzing {done} / {len(todo)}')
+    return batch
+
+
+def _icl_storage_scan():
+    st.header('Storage Scan')
+    _icl_ocr_connection_panel('scan')
+    st.caption('Read labels → Choose a location once → Save matched bottles together → Review the rest')
+    if not get_ocr_api_key():
+        st.error('OCR is not configured. Ask an administrator to set OCR_API_KEY.')
+    uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
+        accept_multiple_files=True, key='icl_scan_uploads')
+    st.caption('Each photo is one review item. To combine multiple views of one bottle, use Add Chemical.')
+    items, warnings = expand_inventory_scan_uploads(uploads)
+    if warnings:
+        with st.expander('Upload notes'):
+            for warning in warnings:
+                st.write(warning)
+    signature = hashlib.sha256('|'.join(i['scan_id'] for i in items).encode()).hexdigest()
+    previous = st.session_state.get('inventory_scan_batch') or []
+    if items and previous and st.session_state.get('icl_scan_upload_signature') != signature:
+        st.info('Your upload list has changed. Analyze photos to update the review queue.')
+    if st.button('Analyze photos', type='primary', disabled=not items or not get_ocr_api_key()):
+        st.session_state['inventory_scan_batch'] = _icl_scan_analyze(items, previous)
+        st.session_state['icl_scan_upload_signature'] = signature
+        st.session_state.pop('icl_scan_selected', None)
+        st.rerun()
+    batch = st.session_state.get('inventory_scan_batch') or []
+    if not batch:
+        st.info('Upload photos to review product details and link them to your inventory.')
+        return
+    notice = st.session_state.pop('icl_scan_notice', None)
+    if notice:
+        saved, failures = notice
+        if saved:
+            st.success(f'Saved {saved} photo(s).')
+        for failure in failures:
+            st.error('Not saved · ' + failure)
+    done = sum(_icl_scan_done(r) for r in batch)
+    st.progress(done / len(batch), text=f'Completed {done} / {len(batch)}')
+    if done == len(batch):
+        st.success('Every photo in this batch is complete.')
+    storage_options = get_storage_options()
+    target, move = _icl_scan_target_location(storage_options)
+    _icl_scan_quick_table(batch, storage_options, target, move)
+    _icl_scan_review_one(batch, storage_options, target, move)
 
 
 def _icl_add_photos():
@@ -3975,7 +4341,7 @@ def _icl_add_photos():
         _icl_clear_add_identity()
         st.session_state['icl_add_context'] = context
     if records:
-        st.image(records[0]['bytes'], caption='Original photo · ' + records[0]['filename'], width=440)
+        _icl_show_label(records[0], 'add_' + str(records[0].get('scan_id', '')))
         if len(records) > 1:
             with st.expander(f'Additional views of this bottle: {len(records) - 1} photos'):
                 for record in records[1:]:
