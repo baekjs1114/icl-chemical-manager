@@ -3764,14 +3764,14 @@ def _icl_exact_bottle_matches(candidate):
     return found
 
 
-def _icl_scan_save(record, candidate, bottle, storage, move):
+def _icl_scan_save(record, candidate, bottle, storage, move, status=None):
     # Revalidate the signed candidate before making any database mutation.
     result = record['result']
     draft = __import__('icl_ocr_ui_guard')._post(globals(), '/draft', {
         'review_token': result.get('review_token'), 'candidate_id': candidate.get('candidate_id'), 'reviewed': True})
     evidence = dict(result)
     evidence['_user_selected_identity'] = draft['fields']
-    return _icl_scan_write(record, bottle, storage, move, evidence, draft['fields'].get('cas'))
+    return _icl_scan_write(record, bottle, storage, move, evidence, draft['fields'].get('cas'), status=status)
 
 
 def _icl_scan_save_manual(record, bottle, storage, move, search_text, status=None, check_location=True):
@@ -3946,7 +3946,7 @@ def _icl_label_image(image_bytes, result, flip=False):
     return buffer.getvalue()
 
 
-def _icl_show_label(record, key, caption_prefix=''):
+def _icl_show_label(record, key, caption_prefix='', width=640):
     """Show the upright label crop with the original photo behind an expander."""
     result = record.get('result') or {}
     flip = bool(record.get('_label_flip'))
@@ -3958,9 +3958,9 @@ def _icl_show_label(record, key, caption_prefix=''):
     label = cache[1]
     caption = caption_prefix + record['filename']
     if not label:
-        st.image(record['bytes'], caption=caption, width=440)
+        st.image(record['bytes'], caption=caption, width=440 if width == 640 else width)
         return
-    st.image(label, caption='Detected label · ' + caption, width=640)
+    st.image(label, caption='Detected label · ' + caption, width=width)
     left, right = st.columns([1, 3])
     if left.button('Flip 180°', key=key + '_flip'):
         record['_label_flip'] = not flip
@@ -4093,7 +4093,7 @@ def _icl_bottle_option(bottle):
 
 
 @st.fragment
-def _icl_scan_quick_table(batch, storage_options, target, move):
+def _icl_scan_quick_table(batch, storage_options, target, move, status=None):
     pending = [r for r in batch if not _icl_scan_done(r)]
     ready = [r for r in pending if _icl_scan_auto_match(r)['candidate']]
     st.markdown(f'#### Quick confirm · {len(ready)} of {len(pending)} photos')
@@ -4161,7 +4161,7 @@ def _icl_scan_quick_table(batch, storage_options, target, move):
                 seen[bottle['id']] = record['filename']
                 observed, will_move = _icl_scan_location_for(bottle, storage_options, target, move)
                 try:
-                    record['saved_observation_id'] = _icl_scan_save(record, auto['candidate'], bottle, observed, will_move)
+                    record['saved_observation_id'] = _icl_scan_save(record, auto['candidate'], bottle, observed, will_move, status=status)
                     record['resolved_action'] = 'existing_bottle_observation'
                     saved += 1
                 except Exception as exc:
@@ -4497,6 +4497,9 @@ def _icl_scan_simple_choices(record, target):
 def _icl_scan_simple(batch, storage_options, target, status):
     """One photo at a time: pick the bottle from a short list, search, or register."""
     pending = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
+    # Photos the quick table above can save in bulk come last, so the cards
+    # start with the ones that need a decision.
+    pending.sort(key=lambda i: bool(_icl_scan_auto_match(batch[i])['candidate']))
     last = st.session_state.pop('icl_simple_last', None)
     if last:
         st.success(last)
@@ -4509,25 +4512,28 @@ def _icl_scan_simple(batch, storage_options, target, status):
     current = st.session_state.get('icl_simple_index')
     if current not in pending:
         current = pending[0]
-    position = len(batch) - len(pending) + 1
     record = batch[current]
     scope = 'simple_' + record['scan_id']
-    st.markdown(f'#### Photo {position} of {len(batch)}')
+    st.markdown(f'#### One photo at a time · {len(pending)} left')
+    if _icl_scan_auto_match(record)['candidate']:
+        st.caption('This photo is also in the quick table above.')
 
     def done(message):
         record.pop('_label_view', None)
-        later = [i for i in pending if i > current] or [i for i in pending if i < current]
-        st.session_state['icl_simple_index'] = later[0] if later else None
+        rest = [i for i in pending if i != current]
+        st.session_state['icl_simple_index'] = rest[0] if rest else None
         st.session_state['icl_simple_last'] = message
         st.rerun(scope='app')
 
-    left, right = st.columns([1, 1.3])
-    with left:
-        _icl_show_label(record, scope)
-        if st.button('Skip this photo', key=scope + '_skip', width='stretch'):
-            record['skipped'] = True
-            done('Skipped ' + record['filename'])
-    with right:
+    # Stacked, not side by side: a fixed-width image overflowed its column and
+    # long bottle labels did not fit next to it.
+    image_col, skip_col = st.columns([3, 1])
+    with image_col:
+        _icl_show_label(record, scope, width='stretch')
+    if skip_col.button('Skip this photo', key=scope + '_skip', width='stretch'):
+        record['skipped'] = True
+        done('Skipped ' + record['filename'])
+    with st.container():
         if record.get('error') or not record.get('result'):
             st.error('This photo could not be read: ' + str(record.get('error') or 'no result'))
             choices = []
@@ -4758,7 +4764,9 @@ def _icl_scan_analyze(items, previous):
 def _icl_storage_scan():
     st.header('Storage Scan')
     _icl_ocr_connection_panel('scan')
-    st.caption('Read labels → Choose a location once → Save matched bottles together → Review the rest')
+    st.radio('Mode', ['Simple · one photo at a time', 'Advanced · table and full review'],
+        horizontal=True, key='icl_scan_mode')
+    st.caption('Upload photos → Analyze → Choose where they go → Pick the matching bottle for each photo')
     if not get_ocr_api_key():
         st.error('OCR is not configured. Ask an administrator to set OCR_API_KEY.')
     uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
@@ -4798,14 +4806,16 @@ def _icl_storage_scan():
     if done == len(batch):
         st.success('Every photo in this batch is complete.')
     storage_options = get_storage_options()
-    mode = st.radio('Mode', ['Simple · one photo at a time', 'Advanced · table and full review'],
-        horizontal=True, key='icl_scan_mode')
+    mode = st.session_state.get('icl_scan_mode') or 'Simple · one photo at a time'
     target, move = _icl_scan_target_location(storage_options, show_move=not mode.startswith('Simple'))
     if mode.startswith('Simple'):
         throw_like = target is not None and re.search(r'throw|dispos|폐기', str(target[2]), re.I)
         pending_status = st.checkbox('Also mark these bottles as Disposal Pending', value=bool(throw_like),
             key='icl_scan_simple_pending_' + str(target[0] if target else ''))
-        _icl_scan_simple(batch, storage_options, target, 'Disposal Pending' if pending_status else None)
+        status = 'Disposal Pending' if pending_status else None
+        if target is not None:
+            _icl_scan_quick_table(batch, storage_options, target, True, status=status)
+        _icl_scan_simple(batch, storage_options, target, status)
         return
     _icl_scan_quick_table(batch, storage_options, target, move)
     _icl_scan_review_one(batch, storage_options, target, move)
