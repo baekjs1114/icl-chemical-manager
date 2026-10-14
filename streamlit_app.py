@@ -14,6 +14,7 @@ import os
 import zipfile
 import queue
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
@@ -33,6 +34,20 @@ import requests
 import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill
 from PIL import Image, ImageOps
+
+
+# Per-click timing shown at the bottom of the sidebar: total script time and
+# how much of it was spent waiting on the database.
+_ICL_PERF = {"start": time.perf_counter(), "db_calls": 0, "db_seconds": 0.0}
+
+
+def _icl_db_timed(fn, *args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _ICL_PERF["db_calls"] += 1
+        _ICL_PERF["db_seconds"] += time.perf_counter() - started
 
 
 # ============================================================
@@ -531,7 +546,7 @@ class CompatCursor:
         if is_insert and not has_returning:
             translated = translated.rstrip().rstrip(";") + " RETURNING id"
 
-        self._cursor.execute(translated, params or ())
+        _icl_db_timed(self._cursor.execute, translated, params or ())
 
         if is_insert:
             try:
@@ -681,7 +696,7 @@ class CompatConnection:
         if self._pool is None:
             self._conn.close()
         else:
-            self._pool.release(self._conn)
+            _icl_db_timed(self._pool.release, self._conn)
 
     def __del__(self):
         # Many callers close only on the happy path. An exception, st.rerun()
@@ -697,7 +712,7 @@ class CompatConnection:
 def get_connection():
     pool = _get_db_connection_pool()
     try:
-        raw = pool.acquire(timeout=1)
+        raw = _icl_db_timed(pool.acquire, timeout=1)
     except queue.Empty:
         # Every pooled connection is busy: use a one-off connection rather
         # than failing the page. It is closed (not pooled) on close().
@@ -1292,7 +1307,15 @@ def require_authenticated_user():
             st.logout()
         st.stop()
 
-    app_user = _get_app_user(email)
+    # Every click reruns the script; re-check the account at most once a minute
+    # instead of on every click. Deactivation still takes effect within 60 s.
+    cached = st.session_state.get("_icl_app_user_cache")
+    if cached and cached[0] == email and time.time() - cached[1] < 60:
+        app_user = cached[2]
+    else:
+        app_user = _get_app_user(email)
+        if app_user is not None:
+            st.session_state["_icl_app_user_cache"] = (email, time.time(), app_user)
     if app_user is None:
         app_user = _bootstrap_admin_if_allowed(email, identity_name)
 
@@ -8493,3 +8516,9 @@ def render_icl_live_test():
 
 if menu == "OCR Live Test":
     render_icl_live_test()
+
+
+st.sidebar.caption(
+    f"This page: {time.perf_counter() - _ICL_PERF['start']:.1f}s · "
+    f"database: {_ICL_PERF['db_calls']} calls, {_ICL_PERF['db_seconds']:.1f}s"
+)
