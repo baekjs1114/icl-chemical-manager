@@ -697,7 +697,7 @@ class CompatConnection:
 def get_connection():
     pool = _get_db_connection_pool()
     try:
-        raw = pool.acquire(timeout=5)
+        raw = pool.acquire(timeout=1)
     except queue.Empty:
         # Every pooled connection is busy: use a one-off connection rather
         # than failing the page. It is closed (not pooled) on close().
@@ -2382,6 +2382,22 @@ def _guess_image_mime(filename):
         "png": "image/png",
         "webp": "image/webp",
     }.get(ext, "application/octet-stream")
+
+
+def _icl_expand_uploads_cached(uploaded_files, cache_key):
+    """expand_inventory_scan_uploads, run once per upload set instead of on every rerun.
+
+    Expanding copies, hashes and (for ZIPs) decompresses every uploaded photo.
+    With ~100 phone photos that is hundreds of MB of work on each click.
+    """
+    files = list(uploaded_files or [])
+    signature = tuple((getattr(f, 'file_id', None) or f.name, getattr(f, 'size', None)) for f in files)
+    cached = st.session_state.get(cache_key)
+    if cached and cached[0] == signature:
+        return cached[1], cached[2]
+    items, warnings = expand_inventory_scan_uploads(files)
+    st.session_state[cache_key] = (signature, items, warnings)
+    return items, warnings
 
 
 def expand_inventory_scan_uploads(uploaded_files, max_images=120):
@@ -4310,15 +4326,23 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
             key=scope + '_manual_pieces', on_change=use_pieces, placeholder='Pieces are listed in label reading order')
     query = st.text_input('Search inventory', key=search_key,
         placeholder='Chemical name, CAS, catalog, lot or Bottle ID')
+    searches = record.setdefault('_searches', {})
+
+    def search(terms, match_all):
+        key = (tuple(terms), match_all)
+        if key not in searches:
+            searches[key] = _icl_search_bottles(terms, match_all=match_all)
+        return searches[key]
+
     try:
         if query.strip():
-            bottles = _icl_search_bottles(query.split(), match_all=True)
+            bottles = search(query.split(), True)
             if not bottles and len(query.split()) > 1:
-                bottles = _icl_search_bottles([query], match_all=True)
+                bottles = search([query], True)
             heading = f'{len(bottles)} bottles match "{query.strip()}"'
         else:
             codes = [v for label, v in pairs if label in ('Catalog', 'Lot', 'CAS')]
-            bottles = _icl_search_bottles(codes, match_all=False) if codes else []
+            bottles = search(codes, False) if codes else []
             heading = (f'{len(bottles)} bottles share a catalog, lot or CAS read from the label'
                        if codes else 'Type a search or pick text read from the label.')
     except Exception as exc:
@@ -4424,9 +4448,22 @@ def _icl_scan_review_one(batch, storage_options, target, move):
         _icl_scan_manual_panel(record, storage_options, target, move, scope, saved)
         return
     if not ready:
+        if result.get('verification_status') == 'CONFLICT' or result.get('conflicts'):
+            # The OCR server refuses /draft for conflicting evidence, so the candidate
+            # cannot be saved. Linking to a bottle picked from inventory still works.
+            reasons = ', '.join(str(c).split(':')[0].replace('_', ' ') for c in result.get('conflicts') or []) or 'conflicting evidence'
+            st.warning('This candidate cannot be saved because the label evidence conflicts (' + reasons
+                       + '). Pick the bottle from inventory below instead.')
+            _icl_scan_manual_panel(record, storage_options, target, move, scope, saved)
+            return
         st.caption('Select a product and confirm the label match to continue.')
         return
-    matches = _icl_exact_bottle_matches(candidate)
+    # Inventory lookups are cached per photo and candidate; saving re-checks the bottle under a row lock.
+    match_cache = record.setdefault('_matches', {})
+    match_key = _icl_result_key(result) + ':' + str(candidate.get('candidate_id'))
+    if match_key not in match_cache:
+        match_cache[match_key] = _icl_exact_bottle_matches(candidate)
+    matches = match_cache[match_key]
     action_options = ['Existing bottle · Add an observation', 'New bottle · Create a Bottle ID']
     action = st.radio('How would you like to handle this bottle?', action_options,
         index=0 if matches else 1,
@@ -4514,7 +4551,7 @@ def _icl_storage_scan():
     uploads = st.file_uploader('Bottle photos or ZIP', type=['jpg', 'jpeg', 'png', 'webp', 'zip'],
         accept_multiple_files=True, key='icl_scan_uploads')
     st.caption('Each photo is one review item. To combine multiple views of one bottle, use Add Chemical.')
-    items, warnings = expand_inventory_scan_uploads(uploads)
+    items, warnings = _icl_expand_uploads_cached(uploads, '_icl_scan_upload_cache')
     if warnings:
         with st.expander('Upload notes'):
             for warning in warnings:
@@ -4584,7 +4621,7 @@ def _icl_add_photos():
             accept_multiple_files=True, key='icl_add_upload_' + str(nonce))
         with st.expander('Take a photo'):
             camera = st.camera_input('Photograph the front of the label', key='icl_add_camera_' + str(nonce))
-        items, warnings = expand_inventory_scan_uploads(list(uploads or []) + ([camera] if camera else []))
+        items, warnings = _icl_expand_uploads_cached(list(uploads or []) + ([camera] if camera else []), '_icl_add_upload_cache')
         if warnings:
             with st.expander('Upload notes'):
                 for warning in warnings:
