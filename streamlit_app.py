@@ -719,6 +719,11 @@ def init_db():
         ON storage_units (LOWER(storage_name))
         """
     )
+    # Storage units such as a disposal/throw list can be kept out of the
+    # default Chemical Search list.
+    conn.execute(
+        "ALTER TABLE storage_units ADD COLUMN IF NOT EXISTS hidden_from_lists BOOLEAN NOT NULL DEFAULT FALSE"
+    )
 
     conn.execute(
         """
@@ -3626,7 +3631,7 @@ def _icl_review_product(result, scope):
     same = {clean_text(c.get('cas')) or normalize_chemical_name(c.get('name')) for c in plain}
     preselect = choices.index(plain[0]) if plain and len(same) == 1 else None
     selected = st.radio('Select a product', list(range(len(choices))) + [-1], index=preselect,
-        format_func=lambda i: 'None match · Enter manually or retake' if i == -1 else guard.candidate_label(choices[i]),
+        format_func=lambda i: 'None match · Find the bottle myself' if i == -1 else guard.candidate_label(choices[i]),
         key=key + '_candidate')
     candidate = choices[selected] if selected is not None and 0 <= selected < len(choices) else None
     acknowledged = False
@@ -3695,12 +3700,27 @@ def _icl_scan_save(record, candidate, bottle, storage, move):
     result = record['result']
     draft = __import__('icl_ocr_ui_guard')._post(globals(), '/draft', {
         'review_token': result.get('review_token'), 'candidate_id': candidate.get('candidate_id'), 'reviewed': True})
+    evidence = dict(result)
+    evidence['_user_selected_identity'] = draft['fields']
+    return _icl_scan_write(record, bottle, storage, move, evidence, draft['fields'].get('cas'))
+
+
+def _icl_scan_save_manual(record, bottle, storage, move, search_text):
+    """Link a photo the OCR could not identify to a bottle the user picked from inventory."""
+    evidence = dict(record.get('result') or {})
+    evidence['_manual_identity'] = {'source': 'manual_inventory_pick', 'search': clean_text(search_text),
+        'bottle_id': bottle.get('bottle_id'), 'chemical_name': bottle.get('chemical_name'),
+        'cas': bottle.get('cas_number')}
+    return _icl_scan_write(record, bottle, storage, move, evidence, None)
+
+
+def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas):
     conn = get_connection()
     try:
         current = conn.execute('SELECT * FROM chemicals WHERE id=? FOR UPDATE', (bottle['id'],)).fetchone()
         if not current or current['status'] == 'Disposed':
             raise ValueError('This bottle was deleted or disposed of. Refresh the inventory before continuing.')
-        expected = clean_text(draft['fields'].get('cas'))
+        expected = clean_text(expected_cas)
         if expected and clean_text(current['cas_number']) and expected != clean_text(current['cas_number']):
             raise ValueError('The bottle\'s CAS has changed. Review the record again.')
         if (current['storage_unit_id'], current['shelf_number']) != (bottle['storage_unit_id'], bottle['shelf_number']):
@@ -3711,10 +3731,8 @@ def _icl_scan_save(record, candidate, bottle, storage, move):
                  datetime.now().strftime('%Y-%m-%d %H:%M'), bottle['id']))
             write_audit_log('MOVE_CHEMICAL', target_type='chemical', target_id=bottle['id'],
                 bottle_id=bottle['bottle_id'], details=json.dumps({'location': storage[2]}, ensure_ascii=False), conn=conn)
-        evidence = dict(result)
-        evidence['_user_selected_identity'] = draft['fields']
         observation_id = save_inventory_observation(bottle['id'], record['filename'], record['bytes'],
-            decode_ocr_label_crop(result), evidence, storage[0], storage[1], _conn=conn)
+            decode_ocr_label_crop(record.get('result') or {}), evidence, storage[0], storage[1], _conn=conn)
         conn.commit()
         return observation_id
     except Exception:
@@ -4056,6 +4074,211 @@ def _icl_scan_quick_table(batch, storage_options, target, move):
         st.rerun()
 
 
+_ICL_SEARCH_COLUMNS = ('c.bottle_id', 'c.legacy_id', 'c.chemical_name', 'c.cas_number',
+                       'c.catalog_number', 'c.lot_number', 'c.manufacturer')
+
+
+def _icl_search_bottles(terms, match_all=True):
+    """Inventory search for photos the OCR could not identify.
+
+    match_all=True: every term must appear in some column (typed search).
+    match_all=False: any term may match (suggestions from label fields).
+    """
+    terms = [t for t in dict.fromkeys(clean_text(t) for t in terms) if len(t) >= 2][:8]
+    if not terms:
+        return []
+    per_term = '(' + ' OR '.join(col + ' ILIKE ?' for col in _ICL_SEARCH_COLUMNS) + ')'
+    where = (' AND ' if match_all else ' OR ').join([per_term] * len(terms))
+    params = []
+    for term in terms:
+        params.extend(['%' + term + '%'] * len(_ICL_SEARCH_COLUMNS))
+    conn = get_connection()
+    try:
+        rows = conn.execute(f"""
+            SELECT c.*, {LOCATION_EXPR} AS location_text
+            FROM chemicals c
+            LEFT JOIN storage_units su ON c.storage_unit_id = su.id
+            WHERE c.status != 'Disposed' AND ({where})
+            ORDER BY c.chemical_name, c.bottle_id
+            LIMIT 40
+            """, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def _icl_label_terms(result):
+    """(label, value) pairs read from the label, structured fields first, then raw OCR lines."""
+    fields = result.get('fields') or {}
+    meta = result.get('metadata') or {}
+    pairs = []
+    for field, label in (('catalog', 'Catalog'), ('lot', 'Lot'), ('cas', 'CAS'), ('name', 'Name'), ('manufacturer', 'Maker')):
+        values = [x.get('value') for x in fields.get(field) or []]
+        values.append(meta.get('label_name') if field == 'name' else meta.get(field))
+        if field == 'catalog':
+            # Labels often print the package size after the catalog (C11081-100G);
+            # inventory usually stores only the catalog number.
+            values = [re.sub(r'(?i)-\d+(\.\d+)?\s*(G|MG|KG|UG|ML|L|EA)$', '', clean_text(v)) for v in values] + values
+        for value in values:
+            value = clean_text(value)
+            if value and (label, value) not in pairs:
+                pairs.append((label, value))
+    seen = {v for _, v in pairs}
+    for obs in result.get('observations') or []:
+        text = clean_text(obs.get('text'))
+        if obs.get('pass_id', 'full') == 'full' and len(text) >= 3 and text not in seen:
+            seen.add(text)
+            pairs.append(('Text', text))
+    return pairs
+
+
+def _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, on_saved):
+    """Register a bottle that is not in inventory without leaving Storage Scan.
+
+    The photo is attached as the new bottle's first observation. When the
+    details came from an OCR candidate, the signed candidate is revalidated
+    with /draft before anything is written.
+    """
+    # The prefill is part of the key so picking another label line refreshes the form.
+    key = scope + '_reg_' + _icl_result_key(record.get('result') or {}) + '_' + str((candidate or {}).get('candidate_id', 'manual')) \
+        + '_' + hashlib.sha256(json.dumps(prefill, sort_keys=True, default=str).encode()).hexdigest()[:8]
+    maker = clean_text(prefill.get('manufacturer'))
+    with st.form(key + '_form', enter_to_submit=False):
+        name = st.text_input('Chemical name *', value=clean_text(prefill.get('name')), key=key + '_name')
+        a, b = st.columns(2)
+        cas = a.text_input('CAS No.', value=clean_text(prefill.get('cas')), key=key + '_cas')
+        manufacturer = b.text_input('Manufacturer', value=(canonical_label_vendor(maker) or maker) if maker else '', key=key + '_maker')
+        catalog = a.text_input('Catalog No.', value=clean_text(prefill.get('catalog')), key=key + '_catalog')
+        lot = b.text_input('Lot No.', value=clean_text(prefill.get('lot')), key=key + '_lot')
+        amount_col, unit_col, remaining_col = st.columns([2, 1, 2])
+        units = ['g', 'mg', 'kg', 'mL', 'L', 'ea']
+        amount = amount_col.number_input('Amount', min_value=0.0, value=float(prefill.get('amount') or 0.0), key=key + '_amount')
+        unit = unit_col.selectbox('Unit', units, index=units.index(prefill['unit']) if prefill.get('unit') in units else 0, key=key + '_unit')
+        remaining = remaining_col.number_input('Remaining amount', min_value=0.0, value=float(prefill.get('amount') or 0.0), key=key + '_remaining')
+        c, d = st.columns(2)
+        storage = c.selectbox('Storage location', storage_options,
+            index=storage_options.index(target) if target in storage_options else 0,
+            format_func=lambda x: x[2], key=key + '_storage')
+        status = d.selectbox('Status', ['Unopened', 'In Use', 'Disposal Pending'], key=key + '_status')
+        confirmed = st.checkbox('I checked the name, CAS and amount against the label.', key=key + '_confirm')
+        submitted = st.form_submit_button('Register new bottle with this photo', type='primary')
+    if not submitted:
+        return
+    if not confirmed:
+        st.error('Tick the confirmation checkbox first.')
+        return
+    if not name.strip():
+        st.error('Enter a chemical name.')
+        return
+    if remaining > amount:
+        st.error('Remaining amount cannot exceed the amount.')
+        return
+    draft = None
+    try:
+        if candidate:
+            draft = __import__('icl_ocr_ui_guard')._post(globals(), '/draft', {
+                'review_token': record['result'].get('review_token'),
+                'candidate_id': candidate.get('candidate_id'), 'reviewed': True})
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        values = dict(chemical_name=name.strip(), description='', cas_number=cas.strip(),
+            manufacturer=manufacturer.strip(), catalog_number=catalog.strip(), lot_number=lot.strip(),
+            amount=amount, initial_amount=amount, remaining_amount=remaining, unit=unit,
+            storage_unit_id=storage[0], shelf_number=storage[1],
+            location=storage[2] if storage[0] is not None else '', owner='', expiration_date='', status=status,
+            source_registered_date=datetime.now(ZoneInfo('Asia/Seoul')).date().strftime('%Y-%m-%d'),
+            molecular_formula=clean_text(prefill.get('formula')), molecular_weight=clean_text(prefill.get('mw')),
+            purity='', created_at=timestamp, updated_at=timestamp)
+        bottle_id = _icl_register_new_bottle(values, storage, [record], draft or {'fields': {'source': 'storage_scan_manual_registration'}},
+            record['scan_id'])
+    except Exception as exc:
+        st.error('Registration failed: ' + _icl_exception_message(exc))
+        return
+    record['registered_bottle_id'] = bottle_id
+    record['resolved_action'] = 'new_bottle_registration'
+    try:
+        safety = fetch_pubchem_safety(cas.strip(), name.strip())
+        if safety:
+            save_pubchem_safety(int(bottle_id.rsplit('-', 1)[1]), safety)
+    except Exception:
+        pass
+    on_saved()
+
+
+def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_saved):
+    """Find the bottle by hand when the OCR has no usable product candidate."""
+    result = record.get('result') or {}
+    st.markdown('##### Find the bottle in inventory')
+    pairs = _icl_label_terms(result)
+    search_key = scope + '_manual_q'
+
+    def use_line():
+        picked = st.session_state.get(scope + '_manual_line')
+        if picked is not None:
+            st.session_state[search_key] = pairs[picked][1]
+
+    if pairs:
+        st.selectbox('Use text read from the label', range(len(pairs)), index=None,
+            placeholder='Pick a name, lot or catalog the OCR read',
+            format_func=lambda i: pairs[i][0] + ' · ' + pairs[i][1], key=scope + '_manual_line', on_change=use_line)
+    query = st.text_input('Search inventory', key=search_key,
+        placeholder='Chemical name, CAS, catalog, lot or Bottle ID')
+    try:
+        if query.strip():
+            bottles = _icl_search_bottles(query.split(), match_all=True)
+            if not bottles and len(query.split()) > 1:
+                bottles = _icl_search_bottles([query], match_all=True)
+            heading = f'{len(bottles)} bottles match "{query.strip()}"'
+        else:
+            codes = [v for label, v in pairs if label in ('Catalog', 'Lot', 'CAS')]
+            bottles = _icl_search_bottles(codes, match_all=False) if codes else []
+            heading = (f'{len(bottles)} bottles share a catalog, lot or CAS read from the label'
+                       if codes else 'Type a search or pick text read from the label.')
+    except Exception as exc:
+        st.error('Inventory search failed: ' + _icl_exception_message(exc))
+        return
+    st.caption(heading)
+    if bottles:
+        mapping = {b['id']: b for b in bottles}
+        lots = {_icl_lot_key(v) for label, v in pairs if label == 'Lot'} - {''}
+        lot_hits = [b['id'] for b in bottles if _icl_lot_key(b.get('lot_number')) in lots]
+        ids = list(mapping)
+        default = ids.index(lot_hits[0]) if len(lot_hits) == 1 else (0 if len(ids) == 1 else None)
+
+        def describe(i):
+            b = mapping[i]
+            extra = ' · '.join(x for x in (clean_text(b.get('catalog_number')), clean_text(b.get('lot_number')) and 'Lot ' + clean_text(b.get('lot_number'))) if x)
+            return _icl_bottle_option(b) + (' · ' + extra if extra else '')
+
+        bottle_id = st.selectbox('Select the physical bottle', ids, index=default, format_func=describe,
+            placeholder='Choose a bottle', key=scope + '_manual_bottle')
+        if bottle_id is not None:
+            bottle = mapping[bottle_id]
+            key = scope + '_manual_' + str(bottle_id)
+            default_observed, _ = _icl_scan_location_for(bottle, storage_options, target, move)
+            observed = st.selectbox('Observed storage location', storage_options,
+                index=storage_options.index(default_observed), format_func=lambda x: x[2], key=key + '_storage')
+            move_here = st.checkbox("Also update the bottle's current storage location", value=move, key=key + '_move')
+            unchanged = (observed[0], observed[1]) == (bottle['storage_unit_id'], bottle['shelf_number'])
+            move_here = bool(move_here and not unchanged)
+            st.write(f"**{bottle['bottle_id']}** · " + (('Move to ' if move_here else 'Observed at ') + observed[2]))
+            if st.button('Link this photo to the bottle and save', type='primary', key=key + '_save'):
+                try:
+                    record['saved_observation_id'] = _icl_scan_save_manual(record, bottle, observed, move_here, query)
+                    record['resolved_action'] = 'existing_bottle_observation'
+                except Exception as exc:
+                    st.error('Could not save: ' + _icl_exception_message(exc))
+                else:
+                    on_saved()
+    with st.expander('Not in inventory? Register it as a new bottle here'):
+        values = {}
+        for label, value in pairs:
+            values.setdefault(label, value)
+        typed_name = query.strip() if query.strip() and not any(ch.isdigit() for ch in query) else ''
+        prefill = {'name': values.get('Name') or typed_name, 'cas': values.get('CAS', ''),
+                   'catalog': values.get('Catalog', ''), 'lot': values.get('Lot', ''), 'manufacturer': values.get('Maker', '')}
+        _icl_scan_register_form(record, storage_options, target, scope, prefill, None, on_saved)
+
+
 @st.fragment
 def _icl_scan_review_one(batch, storage_options, target, move):
     pending_order = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
@@ -4108,7 +4331,15 @@ def _icl_scan_review_one(batch, storage_options, target, move):
     auto = _icl_scan_auto_match(record)
     if auto['reason']:
         st.caption('Needs review · ' + auto['reason'])
+    def saved():
+        st.session_state['icl_scan_notice'] = (1, [])
+        advance(selected_index)
+        st.rerun(scope='app')
+
     candidate, ready = _icl_review_product(result, scope)
+    if candidate is None:
+        _icl_scan_manual_panel(record, storage_options, target, move, scope, saved)
+        return
     if not ready:
         st.caption('Select a product and confirm the label match to continue.')
         return
@@ -4118,27 +4349,26 @@ def _icl_scan_review_one(batch, storage_options, target, move):
         index=0 if matches else 1,
         key=scope + '_' + _icl_result_key(result) + '_' + candidate['candidate_id'] + '_action')
     if action.startswith('New bottle'):
-        location = st.selectbox('Storage location for the new bottle', storage_options,
-            index=storage_options.index(target) if target in storage_options else 0,
-            format_func=lambda x: x[2], key=scope + '_new_storage')
-        if st.button('Continue to registration', type='primary', key=scope + '_new'):
-            _icl_clear_add_identity()
-            # Clear an earlier Add Chemical group so it cannot replace this handoff.
-            for k in ('add_ocr_batch', 'icl_add_batch', 'add_ocr_records', 'add_ocr_groups', 'add_ocr_group_photos', 'add_ocr_group_id'):
-                st.session_state.pop(k, None)
-            load_add_form_from_ocr(result, record['bytes'], record['filename'], selected_candidate=candidate,
-                source_scan_id=record['scan_id'], evidence_photos=[record])
-            st.session_state['icl_applied_result_key'] = _icl_result_key(result)
-            st.session_state['icl_applied_photos'] = [record]
-            st.session_state['icl_add_context'] = _icl_result_key(result)
-            st.session_state['add_storage'] = location
-            st.session_state['icl_scan_handoff'] = True
-            st.session_state['icl_add_mode'] = 'Photo entry'
-            st.session_state['icl_previous_add_mode'] = 'Photo entry'
-            st.rerun(scope='app')
+        label_fields = result.get('fields') or {}
+        meta = result.get('metadata') or {}
+        lots = [x.get('value') for x in label_fields.get('lot') or []] + [meta.get('lot')]
+        quantity = {}
+        for pack in label_fields.get('package') or []:
+            m = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*(g|mg|kg|mL|ml|L|l)\s*', str(pack.get('value', '')))
+            if m:
+                unit = {'ml': 'mL', 'l': 'L'}.get(m.group(2), m.group(2))
+                quantity = {'amount': float(m.group(1)), 'unit': unit}
+                break
+        prefill = {'name': candidate.get('name'), 'cas': candidate.get('cas'),
+                   'manufacturer': candidate.get('manufacturer') or candidate.get('observed_manufacturer'),
+                   'catalog': candidate.get('catalog') or candidate.get('observed_catalog'),
+                   'lot': next((clean_text(v) for v in lots if clean_text(v)), ''),
+                   'formula': candidate.get('formula'), 'mw': candidate.get('mw'), **quantity}
+        _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, saved)
         return
     if not matches:
-        st.info('No matching inventory records were found. Register a new bottle or check the existing record in Inventory.')
+        st.info('No bottle with this chemical was found automatically. Search the inventory below, or register a new bottle.')
+        _icl_scan_manual_panel(record, storage_options, target, move, scope, saved)
         return
     st.caption('Several bottles may contain the same chemical. Check the physical Bottle ID before linking this photo.')
     mapping = {m['id']: m for m in matches}
@@ -4168,9 +4398,7 @@ def _icl_scan_review_one(batch, storage_options, target, move):
         except Exception as exc:
             st.error('Could not save: ' + _icl_exception_message(exc))
         else:
-            st.session_state['icl_scan_notice'] = (1, [])
-            advance(selected_index)
-            st.rerun(scope='app')
+            saved()
 
 
 def _icl_scan_analyze(items, previous):
@@ -5222,11 +5450,16 @@ if menu == "Chemical Search":
 
     storage_rows = conn.execute(
         """
-        SELECT storage_name
+        SELECT storage_name, COALESCE(hidden_from_lists, FALSE) AS hidden
         FROM storage_units
         ORDER BY storage_name
         """
     ).fetchall()
+    hidden_storages = [
+        row["storage_name"]
+        for row in storage_rows
+        if row["hidden"]
+    ]
 
     manufacturer_rows = conn.execute(
         """
@@ -5305,6 +5538,15 @@ if menu == "Chemical Search":
             status_options
         )
 
+    show_hidden = False
+    if hidden_storages and selected_storage == "All Storage":
+        show_hidden = st.checkbox(
+            "Show hidden locations ("
+            + ", ".join(hidden_storages)
+            + ")",
+            key="search_show_hidden_storage"
+        )
+
     st.write("")
 
     # ========================================================
@@ -5355,6 +5597,14 @@ if menu == "Chemical Search":
 
         params.append(
             selected_storage
+        )
+
+    elif hidden_storages and not show_hidden:
+
+        # Locations marked "hide from lists" (e.g. a throw list) only
+        # appear when selected explicitly or shown on request.
+        conditions.append(
+            "COALESCE(su.hidden_from_lists, FALSE) = FALSE"
         )
 
     # --------------------------------------------------------
@@ -6208,6 +6458,8 @@ elif menu == "Storage Management":
                 su.id,
                 su.storage_name,
                 su.notes,
+                COALESCE(su.hidden_from_lists, FALSE)
+                    AS hidden_from_lists,
 
                 COUNT(
                     DISTINCT ss.id
@@ -6231,7 +6483,8 @@ elif menu == "Storage Management":
             GROUP BY
                 su.id,
                 su.storage_name,
-                su.notes
+                su.notes,
+                su.hidden_from_lists
 
             ORDER BY
                 su.storage_name
@@ -6301,6 +6554,12 @@ elif menu == "Storage Management":
 
                                 st.caption(
                                     storage["notes"]
+                                )
+
+                            if storage["hidden_from_lists"]:
+
+                                st.caption(
+                                    "Hidden from Chemical Search lists"
                                 )
 
                             metric1, metric2 = (
@@ -6402,7 +6661,9 @@ elif menu == "Storage Management":
                 SELECT
                     id,
                     storage_name,
-                    notes
+                    notes,
+                    COALESCE(hidden_from_lists, FALSE)
+                        AS hidden_from_lists
                 FROM storage_units
                 WHERE id = ?
                 """,
@@ -6444,6 +6705,20 @@ elif menu == "Storage Management":
                         value=(
                             storage["notes"]
                             or ""
+                        )
+                    )
+
+                    new_hidden = st.checkbox(
+                        "Hide from Chemical Search lists "
+                        "(e.g. throw / disposal lists)",
+                        value=bool(
+                            storage["hidden_from_lists"]
+                        ),
+                        help=(
+                            "Bottles here are left out of the "
+                            "default Chemical Search list. Select "
+                            "this location or tick 'Show hidden "
+                            "locations' to see them."
                         )
                     )
 
@@ -6516,13 +6791,15 @@ elif menu == "Storage Management":
 
                                     SET
                                         storage_name = ?,
-                                        notes = ?
+                                        notes = ?,
+                                        hidden_from_lists = ?
 
                                     WHERE id = ?
                                     """,
                                     (
                                         new_storage_name.strip(),
                                         new_notes.strip(),
+                                        bool(new_hidden),
                                         storage_id
                                     )
                                 )
@@ -6535,6 +6812,7 @@ elif menu == "Storage Management":
                                             "old_name": storage["storage_name"],
                                             "new_name": new_storage_name.strip(),
                                             "notes": new_notes.strip(),
+                                            "hidden_from_lists": bool(new_hidden),
                                         },
                                         ensure_ascii=False,
                                     ),
