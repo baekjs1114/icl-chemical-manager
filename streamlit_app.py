@@ -4108,13 +4108,13 @@ def _icl_search_bottles(terms, match_all=True):
 
 
 def _icl_label_terms(result):
-    """(label, value) pairs read from the label, structured fields first, then raw OCR lines."""
+    """(label, value) pairs the OCR parsed from the label (catalog, lot, CAS, maker, label name)."""
     fields = result.get('fields') or {}
     meta = result.get('metadata') or {}
     pairs = []
     for field, label in (('catalog', 'Catalog'), ('lot', 'Lot'), ('cas', 'CAS'), ('name', 'Name'), ('manufacturer', 'Maker')):
-        values = [x.get('value') for x in fields.get(field) or []]
-        values.append(meta.get('label_name') if field == 'name' else meta.get(field))
+        # fields['name'] holds single-word name fragments; only the joined label name is useful here.
+        values = [meta.get('label_name')] if field == 'name' else [x.get('value') for x in fields.get(field) or []] + [meta.get(field)]
         if field == 'catalog':
             # Labels often print the package size after the catalog (C11081-100G);
             # inventory usually stores only the catalog number.
@@ -4123,13 +4123,57 @@ def _icl_label_terms(result):
             value = clean_text(value)
             if value and (label, value) not in pairs:
                 pairs.append((label, value))
-    seen = {v for _, v in pairs}
-    for obs in result.get('observations') or []:
-        text = clean_text(obs.get('text'))
-        if obs.get('pass_id', 'full') == 'full' and len(text) >= 3 and text not in seen:
-            seen.add(text)
-            pairs.append(('Text', text))
     return pairs
+
+
+def _icl_ocr_fragments(result):
+    """Every text piece the OCR read, in label reading order (rows top to bottom, left to right).
+
+    Box corners follow the text direction (p0 -> p1 runs along the text), so the
+    summed p0 -> p1 vectors give the label's orientation even on a rotated photo.
+    """
+    import math
+    items = []
+    for o in (result or {}).get('observations') or []:
+        text = clean_text(o.get('text'))
+        if o.get('pass_id', 'full') != 'full' or len(text) < 2:
+            continue
+        box = o.get('box') or []
+        if len(box) >= 4:
+            pts = [(float(x), float(y)) for x, y in box[:4]]
+            items.append((text, pts))
+        else:
+            items.append((text, None))
+    boxed = [(t, b) for t, b in items if b]
+    if not boxed:
+        return list(dict.fromkeys(t for t, _ in items))
+    vx = sum(b[1][0] - b[0][0] for _, b in boxed)
+    vy = sum(b[1][1] - b[0][1] for _, b in boxed)
+    angle = math.atan2(vy, vx)
+    cos, sin = math.cos(angle), math.sin(angle)
+    placed = []
+    for text, b in boxed:
+        cx = sum(x for x, _ in b) / 4
+        cy = sum(y for _, y in b) / 4
+        height = math.hypot(b[3][0] - b[0][0], b[3][1] - b[0][1]) or 1.0
+        placed.append((-sin * cx + cos * cy, cos * cx + sin * cy, height, text))
+    placed.sort()
+    row_gap = sorted(h for *_, h, _ in placed)[len(placed) // 2] * 0.6
+    rows, current, last_y = [], [], None
+    for y, x, h, text in placed:
+        if last_y is not None and y - last_y > row_gap:
+            rows.append(current)
+            current = []
+        current.append((x, text))
+        last_y = y
+    rows.append(current)
+    ordered = [text for row in rows for _, text in sorted(row)]
+    ordered += [t for t, b in items if not b]
+    return list(dict.fromkeys(ordered))
+
+
+def _icl_join_pieces(pieces):
+    return ' '.join(clean_text(p).strip(' ,;:') for p in pieces if clean_text(p).strip(' ,;:'))
 
 
 def _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, on_saved):
@@ -4139,7 +4183,22 @@ def _icl_scan_register_form(record, storage_options, target, scope, prefill, can
     details came from an OCR candidate, the signed candidate is revalidated
     with /draft before anything is written.
     """
-    # The prefill is part of the key so picking another label line refreshes the form.
+    pieces = _icl_ocr_fragments(record.get('result') or {})
+    if pieces:
+        pick = scope + '_regpick_' + str((candidate or {}).get('candidate_id', 'manual'))
+        st.caption('Fill fields from OCR pieces (optional)')
+        n, c1, c2, c3 = st.columns([2, 1, 1, 1])
+        name_pieces = n.multiselect('Name pieces, in order', pieces, key=pick + '_name')
+        cas_piece = c1.selectbox('CAS', pieces, index=None, placeholder='—', key=pick + '_cas')
+        catalog_piece = c2.selectbox('Catalog', pieces, index=None, placeholder='—', key=pick + '_catalog')
+        lot_piece = c3.selectbox('Lot', pieces, index=None, placeholder='—', key=pick + '_lot')
+        prefill = dict(prefill)
+        if name_pieces:
+            prefill['name'] = _icl_join_pieces(name_pieces)
+        for field, piece in (('cas', cas_piece), ('catalog', catalog_piece), ('lot', lot_piece)):
+            if piece:
+                prefill[field] = _icl_join_pieces([piece])
+    # The prefill is part of the key so picking other OCR pieces refreshes the form.
     key = scope + '_reg_' + _icl_result_key(record.get('result') or {}) + '_' + str((candidate or {}).get('candidate_id', 'manual')) \
         + '_' + hashlib.sha256(json.dumps(prefill, sort_keys=True, default=str).encode()).hexdigest()[:8]
     maker = clean_text(prefill.get('manufacturer'))
@@ -4209,17 +4268,17 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
     result = record.get('result') or {}
     st.markdown('##### Find the bottle in inventory')
     pairs = _icl_label_terms(result)
+    pieces = _icl_ocr_fragments(result)
     search_key = scope + '_manual_q'
-
-    def use_line():
-        picked = st.session_state.get(scope + '_manual_line')
-        if picked is not None:
-            st.session_state[search_key] = pairs[picked][1]
-
     if pairs:
-        st.selectbox('Use text read from the label', range(len(pairs)), index=None,
-            placeholder='Pick a name, lot or catalog the OCR read',
-            format_func=lambda i: pairs[i][0] + ' · ' + pairs[i][1], key=scope + '_manual_line', on_change=use_line)
+        st.caption('Read from label: ' + ' · '.join(label + ' ' + value for label, value in pairs))
+
+    def use_pieces():
+        st.session_state[search_key] = _icl_join_pieces(st.session_state.get(scope + '_manual_pieces') or [])
+
+    if pieces:
+        st.multiselect('Pick OCR pieces to search (click them in order, e.g. Carbon → tetrabromide)', pieces,
+            key=scope + '_manual_pieces', on_change=use_pieces, placeholder='Pieces are listed in label reading order')
     query = st.text_input('Search inventory', key=search_key,
         placeholder='Chemical name, CAS, catalog, lot or Bottle ID')
     try:
