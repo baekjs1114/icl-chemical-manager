@@ -3774,13 +3774,13 @@ def _icl_scan_save(record, candidate, bottle, storage, move):
     return _icl_scan_write(record, bottle, storage, move, evidence, draft['fields'].get('cas'))
 
 
-def _icl_scan_save_manual(record, bottle, storage, move, search_text):
+def _icl_scan_save_manual(record, bottle, storage, move, search_text, status=None, check_location=True):
     """Link a photo the OCR could not identify to a bottle the user picked from inventory."""
     evidence = dict(record.get('result') or {})
     evidence['_manual_identity'] = {'source': 'manual_inventory_pick', 'search': clean_text(search_text),
         'bottle_id': bottle.get('bottle_id'), 'chemical_name': bottle.get('chemical_name'),
         'cas': bottle.get('cas_number')}
-    return _icl_scan_write(record, bottle, storage, move, evidence, None)
+    return _icl_scan_write(record, bottle, storage, move, evidence, None, status=status, check_location=check_location)
 
 
 def _icl_scan_forget(record):
@@ -3789,7 +3789,7 @@ def _icl_scan_forget(record):
         record.pop(key, None)
 
 
-def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas):
+def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas, status=None, check_location=True):
     conn = get_connection()
     try:
         current = conn.execute('SELECT * FROM chemicals WHERE id=? FOR UPDATE', (bottle['id'],)).fetchone()
@@ -3798,9 +3798,19 @@ def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas):
         expected = clean_text(expected_cas)
         if expected and clean_text(current['cas_number']) and expected != clean_text(current['cas_number']):
             raise ValueError('The bottle\'s CAS has changed. Review the record again.')
-        if (current['storage_unit_id'], current['shelf_number']) != (bottle['storage_unit_id'], bottle['shelf_number']):
+        if check_location and (current['storage_unit_id'], current['shelf_number']) != (bottle['storage_unit_id'], bottle['shelf_number']):
             raise ValueError('This bottle was moved after the photo was loaded (for example by another photo of the '
                              'same bottle). The row now shows its current location; save it again.')
+        if not check_location:
+            # Simple mode moves the bottle wherever it currently is; only skip the
+            # UPDATE when it is already at the destination.
+            move = (current['storage_unit_id'], current['shelf_number']) != (storage[0], storage[1])
+        if status and current['status'] != status:
+            conn.execute('UPDATE chemicals SET status=?, updated_at=? WHERE id=?',
+                (status, datetime.now().strftime('%Y-%m-%d %H:%M'), bottle['id']))
+            write_audit_log('EDIT_CHEMICAL', target_type='chemical', target_id=bottle['id'],
+                bottle_id=bottle['bottle_id'], details=json.dumps({'status': [current['status'], status],
+                'source': 'storage_scan'}, ensure_ascii=False), conn=conn)
         if move:
             conn.execute('UPDATE chemicals SET storage_unit_id=?, shelf_number=?, location=?, updated_at=? WHERE id=?',
                 (storage[0], storage[1], storage[2] if storage[0] is not None else '',
@@ -3976,7 +3986,7 @@ def _icl_scan_thumbnail(record):
     return record['_thumb']
 
 
-def _icl_scan_target_location(storage_options):
+def _icl_scan_target_location(storage_options, show_move=True):
     """Batch-wide location chosen once; individual review uses it as the default."""
     st.markdown('#### Where were these bottles found or moved to?')
     labels = [option[2] for option in storage_options]
@@ -3985,6 +3995,8 @@ def _icl_scan_target_location(storage_options):
         index=labels.index(current) if current in labels else None,
         placeholder="Keep each bottle's current location", key='icl_scan_target_label')
     target = storage_options[labels.index(target_label)] if target_label in labels else None
+    if not show_move:
+        return target, target is not None
     move = st.checkbox("Also update each bottle's current storage location", value=True,
         key='icl_scan_target_move', disabled=target is None)
     return target, bool(target is not None and move)
@@ -4266,7 +4278,7 @@ def _icl_join_pieces(pieces):
     return ' '.join(clean_text(p).strip(' ,;:') for p in pieces if clean_text(p).strip(' ,;:'))
 
 
-def _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, on_saved):
+def _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, on_saved, default_status='Unopened'):
     """Register a bottle that is not in inventory without leaving Storage Scan.
 
     The photo is attached as the new bottle's first observation. When the
@@ -4312,7 +4324,9 @@ def _icl_scan_register_form(record, storage_options, target, scope, prefill, can
         storage = c.selectbox('Storage location', storage_options,
             index=storage_options.index(target) if target in storage_options else 0,
             format_func=lambda x: x[2], key=key + '_storage')
-        status = d.selectbox('Status', ['Unopened', 'In Use', 'Disposal Pending'], key=key + '_status')
+        statuses = ['Unopened', 'In Use', 'Disposal Pending']
+        status = d.selectbox('Status', statuses, index=statuses.index(default_status) if default_status in statuses else 0,
+            key=key + '_status')
         confirmed = st.checkbox('I checked the name, CAS and amount against the label.', key=key + '_confirm')
         submitted = st.form_submit_button('Register new bottle with this photo', type='primary')
     if not submitted:
@@ -4435,6 +4449,153 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
         prefill = {'name': values.get('Name') or typed_name, 'cas': values.get('CAS', ''),
                    'catalog': values.get('Catalog', ''), 'lot': values.get('Lot', ''), 'manufacturer': values.get('Maker', '')}
         _icl_scan_register_form(record, storage_options, target, scope, prefill, None, on_saved)
+
+
+def _icl_scan_simple_choices(record, target):
+    """Inventory bottles this photo most likely shows, best first (cached per photo).
+
+    Union of every OCR candidate's bottles and bottles sharing a catalog, lot or
+    CAS read from the label. A lot match comes first, then a catalog match.
+    """
+    result = record.get('result') or {}
+    key = _icl_result_key(result)
+    cached = record.get('_simple')
+    if cached and cached[0] == key:
+        return cached[1]
+    found = {}
+    auto = _icl_scan_auto_match(record)
+    for bottle in auto.get('bottles') or []:
+        found.setdefault(bottle['id'], bottle)
+    for candidate in _icl_eligible_candidates(result)[:6]:
+        try:
+            for bottle in _icl_exact_bottle_matches(candidate):
+                found.setdefault(bottle['id'], bottle)
+        except Exception:
+            pass
+    pairs = _icl_label_terms(result)
+    codes = [v for label, v in pairs if label in ('Catalog', 'Lot', 'CAS')]
+    if codes:
+        try:
+            for bottle in _icl_search_bottles(codes, match_all=False):
+                found.setdefault(bottle['id'], bottle)
+        except Exception:
+            pass
+    lots = {_icl_lot_key(v) for label, v in pairs if label == 'Lot'} - {''}
+    catalogs = {str(v).upper() for label, v in pairs if label == 'Catalog'}
+
+    def rank(bottle):
+        lot_hit = _icl_lot_key(bottle.get('lot_number')) in lots
+        catalog_hit = clean_text(bottle.get('catalog_number')).upper() in catalogs
+        return (not lot_hit, not catalog_hit, str(bottle.get('chemical_name') or ''), str(bottle.get('bottle_id') or ''))
+
+    choices = sorted(found.values(), key=rank)[:10]
+    record['_simple'] = (key, choices)
+    return choices
+
+
+@st.fragment
+def _icl_scan_simple(batch, storage_options, target, status):
+    """One photo at a time: pick the bottle from a short list, search, or register."""
+    pending = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
+    last = st.session_state.pop('icl_simple_last', None)
+    if last:
+        st.success(last)
+    if not pending:
+        st.success('Every photo in this batch is done.')
+        return
+    if target is None:
+        st.info('Choose where these bottles go (for example 261014 throw) above to start.')
+        return
+    current = st.session_state.get('icl_simple_index')
+    if current not in pending:
+        current = pending[0]
+    position = len(batch) - len(pending) + 1
+    record = batch[current]
+    scope = 'simple_' + record['scan_id']
+    st.markdown(f'#### Photo {position} of {len(batch)}')
+
+    def done(message):
+        record.pop('_label_view', None)
+        later = [i for i in pending if i > current] or [i for i in pending if i < current]
+        st.session_state['icl_simple_index'] = later[0] if later else None
+        st.session_state['icl_simple_last'] = message
+        st.rerun(scope='app')
+
+    left, right = st.columns([1, 1.3])
+    with left:
+        _icl_show_label(record, scope)
+        if st.button('Skip this photo', key=scope + '_skip', width='stretch'):
+            record['skipped'] = True
+            done('Skipped ' + record['filename'])
+    with right:
+        if record.get('error') or not record.get('result'):
+            st.error('This photo could not be read: ' + str(record.get('error') or 'no result'))
+            choices = []
+        else:
+            choices = _icl_scan_simple_choices(record, target)
+        if choices:
+            st.markdown('**1. Is it one of these bottles?**')
+            for bottle in choices:
+                here = (bottle.get('storage_unit_id'), bottle.get('shelf_number')) == (target[0], target[1])
+                label = _icl_bottle_option(bottle) + ('  ✓ already here' if here else '')
+                if st.button(label, key=scope + '_pick_' + str(bottle['id']), width='stretch'):
+                    try:
+                        record['saved_observation_id'] = _icl_scan_save_manual(
+                            record, bottle, target, True, 'simple mode pick', status=status, check_location=False)
+                        record['resolved_action'] = 'existing_bottle_observation'
+                    except Exception as exc:
+                        _icl_scan_forget(record)
+                        record.pop('_simple', None)
+                        st.error('Could not save: ' + _icl_exception_message(exc))
+                    else:
+                        done(f"Saved {bottle['bottle_id']} · {bottle.get('chemical_name')} → {target[2]}")
+        else:
+            st.markdown('**1. No matching bottle was found automatically.**')
+        st.markdown('**2. Not in the list? Search the whole inventory**')
+        pieces = _icl_ocr_fragments(record.get('result') or {})
+        search_key = scope + '_q'
+
+        def use_pieces():
+            st.session_state[search_key] = _icl_join_pieces(st.session_state.get(scope + '_pieces') or [])
+
+        if pieces:
+            st.multiselect('Or pick words the OCR read', pieces, key=scope + '_pieces', on_change=use_pieces,
+                placeholder='e.g. Carbon → tetrabromide')
+        query = st.text_input('Search by name, CAS, catalog or lot', key=search_key)
+        if query.strip():
+            try:
+                hits = _icl_search_bottles(query.split(), match_all=True)[:15]
+            except Exception as exc:
+                hits = []
+                st.error('Search failed: ' + _icl_exception_message(exc))
+            shown = {b['id'] for b in choices}
+            hits = [b for b in hits if b['id'] not in shown]
+            if not hits:
+                st.caption('No other bottles match "' + query.strip() + '".')
+            for bottle in hits:
+                if st.button(_icl_bottle_option(bottle), key=scope + '_hit_' + str(bottle['id']), width='stretch'):
+                    try:
+                        record['saved_observation_id'] = _icl_scan_save_manual(
+                            record, bottle, target, True, query, status=status, check_location=False)
+                        record['resolved_action'] = 'existing_bottle_observation'
+                    except Exception as exc:
+                        st.error('Could not save: ' + _icl_exception_message(exc))
+                    else:
+                        done(f"Saved {bottle['bottle_id']} · {bottle.get('chemical_name')} → {target[2]}")
+        with st.expander('3. Still not found? Register it as a new bottle'):
+            result = record.get('result') or {}
+            values = {}
+            for label, value in _icl_label_terms(result):
+                values.setdefault(label, value)
+            top = next(iter(_icl_eligible_candidates(result)), {}) if result else {}
+            typed = query.strip() if query.strip() and not any(ch.isdigit() for ch in query) else ''
+            prefill = {'name': typed or top.get('name') or values.get('Name', ''),
+                       'cas': top.get('cas') or values.get('CAS', ''),
+                       'catalog': values.get('Catalog', '') or top.get('catalog') or '',
+                       'lot': values.get('Lot', ''),
+                       'manufacturer': values.get('Maker', '') or top.get('manufacturer') or ''}
+            _icl_scan_register_form(record, storage_options, target, scope, prefill, None,
+                lambda: done(f"Registered a new bottle → {target[2]}"), default_status=status or 'Unopened')
 
 
 @st.fragment
@@ -4637,7 +4798,15 @@ def _icl_storage_scan():
     if done == len(batch):
         st.success('Every photo in this batch is complete.')
     storage_options = get_storage_options()
-    target, move = _icl_scan_target_location(storage_options)
+    mode = st.radio('Mode', ['Simple · one photo at a time', 'Advanced · table and full review'],
+        horizontal=True, key='icl_scan_mode')
+    target, move = _icl_scan_target_location(storage_options, show_move=not mode.startswith('Simple'))
+    if mode.startswith('Simple'):
+        throw_like = target is not None and re.search(r'throw|dispos|폐기', str(target[2]), re.I)
+        pending_status = st.checkbox('Also mark these bottles as Disposal Pending', value=bool(throw_like),
+            key='icl_scan_simple_pending_' + str(target[0] if target else ''))
+        _icl_scan_simple(batch, storage_options, target, 'Disposal Pending' if pending_status else None)
+        return
     _icl_scan_quick_table(batch, storage_options, target, move)
     _icl_scan_review_one(batch, storage_options, target, move)
 
