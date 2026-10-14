@@ -2441,8 +2441,12 @@ def expand_inventory_scan_uploads(uploaded_files, max_images=120):
     seen_hashes = set()
     warnings = []
 
+    skipped_over_limit = 0
+
     def add_item(name, data, source):
+        nonlocal skipped_over_limit
         if len(items) >= max_images:
+            skipped_over_limit += 1
             return
         if not data:
             return
@@ -2536,6 +2540,8 @@ def expand_inventory_scan_uploads(uploaded_files, max_images=120):
         if len(items) >= max_images:
             break
 
+    if skipped_over_limit and not any(w.startswith("Image limit reached") for w in warnings):
+        warnings.append(f"Image limit reached ({max_images}). {skipped_over_limit} more photo(s) were skipped.")
     return items, warnings
 
 
@@ -3777,6 +3783,12 @@ def _icl_scan_save_manual(record, bottle, storage, move, search_text):
     return _icl_scan_write(record, bottle, storage, move, evidence, None)
 
 
+def _icl_scan_forget(record):
+    """Drop cached inventory rows for a photo so the next rerun reads current bottle data."""
+    for key in ('_auto', '_matches', '_searches'):
+        record.pop(key, None)
+
+
 def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas):
     conn = get_connection()
     try:
@@ -3787,7 +3799,8 @@ def _icl_scan_write(record, bottle, storage, move, evidence, expected_cas):
         if expected and clean_text(current['cas_number']) and expected != clean_text(current['cas_number']):
             raise ValueError('The bottle\'s CAS has changed. Review the record again.')
         if (current['storage_unit_id'], current['shelf_number']) != (bottle['storage_unit_id'], bottle['shelf_number']):
-            raise ValueError('Another user changed the storage location. Refresh and review the record again.')
+            raise ValueError('This bottle was moved after the photo was loaded (for example by another photo of the '
+                             'same bottle). The row now shows its current location; save it again.')
         if move:
             conn.execute('UPDATE chemicals SET storage_unit_id=?, shelf_number=?, location=?, updated_at=? WHERE id=?',
                 (storage[0], storage[1], storage[2] if storage[0] is not None else '',
@@ -4078,6 +4091,8 @@ def _icl_scan_quick_table(batch, storage_options, target, move):
     st.caption('Check each photo against the Bottle ID, tick the rows that are correct, then save them together. '
                'When several bottles of the same chemical exist, pick the right Bottle ID in the table. '
                'Ticking a row confirms that you compared the label with the product and the physical Bottle ID.')
+    for failure in st.session_state.get('icl_scan_quick_failures') or []:
+        st.error('Not saved · ' + failure)
     select_all = st.checkbox('Select all rows', value=False, key='icl_scan_quick_all')
     # Fixed picks first, then give same-chemical photos different bottles by default.
     used = {r['_auto']['bottle']['id'] for r in ready if r['_auto']['bottle']}
@@ -4138,9 +4153,11 @@ def _icl_scan_quick_table(batch, storage_options, target, move):
                     record['resolved_action'] = 'existing_bottle_observation'
                     saved += 1
                 except Exception as exc:
+                    _icl_scan_forget(record)
                     failures.append(f"{record['filename']}: {_icl_exception_message(exc)}")
             progress.progress((index + 1) / len(chosen))
-        st.session_state['icl_scan_notice'] = (saved, failures)
+        st.session_state['icl_scan_notice'] = (saved, [])
+        st.session_state['icl_scan_quick_failures'] = failures
         remaining = [i for i, r in enumerate(batch) if not _icl_scan_done(r)]
         if remaining:
             st.session_state['_icl_scan_next'] = remaining[0]
@@ -4406,6 +4423,7 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
                     record['saved_observation_id'] = _icl_scan_save_manual(record, bottle, observed, move_here, query)
                     record['resolved_action'] = 'existing_bottle_observation'
                 except Exception as exc:
+                    _icl_scan_forget(record)
                     st.error('Could not save: ' + _icl_exception_message(exc))
                 else:
                     on_saved()
@@ -4549,6 +4567,7 @@ def _icl_scan_review_one(batch, storage_options, target, move):
             record['saved_observation_id'] = _icl_scan_save(record, candidate, bottle, observed, move_here)
             record['resolved_action'] = 'existing_bottle_observation'
         except Exception as exc:
+            _icl_scan_forget(record)
             st.error('Could not save: ' + _icl_exception_message(exc))
         else:
             saved()
@@ -4585,6 +4604,9 @@ def _icl_storage_scan():
         accept_multiple_files=True, key='icl_scan_uploads')
     st.caption('Each photo is one review item. To combine multiple views of one bottle, use Add Chemical.')
     items, warnings = _icl_expand_uploads_cached(uploads, '_icl_scan_upload_cache')
+    for warning in warnings:
+        if warning.startswith('Image limit reached'):
+            st.warning(warning + ' Only ' + str(len(items)) + ' photos are in this batch; upload the rest as a second batch after finishing this one.')
     if warnings:
         with st.expander('Upload notes'):
             for warning in warnings:
@@ -4597,6 +4619,7 @@ def _icl_storage_scan():
         st.session_state['inventory_scan_batch'] = _icl_scan_analyze(items, previous)
         st.session_state['icl_scan_upload_signature'] = signature
         st.session_state.pop('icl_scan_selected', None)
+        st.session_state.pop('icl_scan_quick_failures', None)
         st.rerun()
     batch = st.session_state.get('inventory_scan_batch') or []
     if not batch:
@@ -5288,6 +5311,7 @@ def _icl_storage_detail_body(storage_id):
     chemicals = conn.execute(
         f"""
         SELECT
+            c.id,
             c.bottle_id AS "Bottle ID",
             c.chemical_name AS "Chemical Name",
             c.cas_number AS "CAS No.",
@@ -5333,7 +5357,34 @@ def _icl_storage_detail_body(storage_id):
                     "Status": chemical["Status"],
                 }
             )
-        st.dataframe(display_data, width="stretch", hide_index=True)
+        st.caption("Click a row to see the bottle's photo and details below.")
+        event = st.dataframe(
+            display_data,
+            width="stretch",
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"storage_dialog_table_{storage_id}_{selected_shelf}",
+        )
+        picked = event.selection.rows if event else []
+        if picked:
+            conn = get_connection()
+            try:
+                detail = conn.execute(
+                    f"""
+                    SELECT c.*, {LOCATION_EXPR} AS location_text
+                    FROM chemicals c
+                    LEFT JOIN storage_units su ON c.storage_unit_id = su.id
+                    WHERE c.id = ?
+                    """,
+                    (chemicals[picked[0]]["id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            if detail:
+                st.divider()
+                # A dialog cannot open another dialog, so the detail renders here.
+                _icl_inventory_detail_body(detail)
     else:
         st.info("No chemicals found in this location.")
 
