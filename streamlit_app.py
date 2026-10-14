@@ -4006,7 +4006,17 @@ def _icl_scan_auto_match(record):
 
 
 def _icl_bottle_option(bottle):
-    return f"{bottle.get('bottle_id')} · {bottle.get('chemical_name')} · {bottle.get('location_text') or 'Not assigned'}"
+    """Bottle choice label: enough to tell same-chemical bottles apart by their label."""
+    amount = bottle.get('initial_amount') or bottle.get('amount')
+    try:
+        amount = (f'{float(amount):g} ' + clean_text(bottle.get('unit'))).strip() if amount not in (None, '') and float(amount) > 0 else ''
+    except (TypeError, ValueError):
+        amount = clean_text(amount)
+    lot = clean_text(bottle.get('lot_number'))
+    parts = [bottle.get('bottle_id'), bottle.get('chemical_name'), clean_text(bottle.get('manufacturer')),
+             amount, clean_text(bottle.get('catalog_number')), 'Lot ' + lot if lot else '',
+             bottle.get('location_text') or 'Not assigned']
+    return ' · '.join(str(x) for x in parts if x)
 
 
 @st.fragment
@@ -4318,12 +4328,7 @@ def _icl_scan_manual_panel(record, storage_options, target, move, scope, on_save
         ids = list(mapping)
         default = ids.index(lot_hits[0]) if len(lot_hits) == 1 else (0 if len(ids) == 1 else None)
 
-        def describe(i):
-            b = mapping[i]
-            extra = ' · '.join(x for x in (clean_text(b.get('catalog_number')), clean_text(b.get('lot_number')) and 'Lot ' + clean_text(b.get('lot_number'))) if x)
-            return _icl_bottle_option(b) + (' · ' + extra if extra else '')
-
-        bottle_id = st.selectbox('Select the physical bottle', ids, index=default, format_func=describe,
+        bottle_id = st.selectbox('Select the physical bottle', ids, index=default, format_func=lambda i: _icl_bottle_option(mapping[i]),
             placeholder='Choose a bottle', key=scope + '_manual_bottle')
         if bottle_id is not None:
             bottle = mapping[bottle_id]
@@ -4452,7 +4457,7 @@ def _icl_scan_review_one(batch, storage_options, target, move):
     if lot_pick and lot_pick['id'] in mapping and len(ids) > 1:
         st.caption('Lot number on the label matches ' + str(lot_pick['bottle_id']) + '.')
     bottle_id = st.selectbox('Select the physical bottle', ids, index=default_index,
-        format_func=lambda i: f'{mapping[i]["bottle_id"]} · {mapping[i]["chemical_name"]} · {mapping[i]["location_text"] or "Not assigned"}',
+        format_func=lambda i: _icl_bottle_option(mapping[i]),
         key=scope + '_' + candidate['candidate_id'] + '_bottle')
     if bottle_id is None:
         return
