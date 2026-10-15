@@ -5015,6 +5015,119 @@ def _image_bytes(value):
     return bytes(value)
 
 
+EXPORT_THUMB_MAX_BYTES = 25 * 1024
+EXPORT_THUMB_DISPLAY_PX = 110
+
+
+def _icl_export_thumbnail(raw_bytes, max_bytes=EXPORT_THUMB_MAX_BYTES):
+    """Shrink a label photo to a JPEG of at most max_bytes (about 25KB)."""
+    if not raw_bytes:
+        return None
+    try:
+        image = ImageOps.exif_transpose(Image.open(BytesIO(raw_bytes))).convert("RGB")
+    except Exception:
+        return None
+    for side in (480, 400, 320, 240, 160):
+        candidate = image.copy()
+        candidate.thumbnail((side, side))
+        for quality in (80, 70, 60, 50, 40):
+            buffer = BytesIO()
+            candidate.save(buffer, format="JPEG", quality=quality, optimize=True)
+            if buffer.tell() <= max_bytes:
+                return buffer.getvalue()
+    return None
+
+
+def _icl_export_thumbnails(chemical_ids, chunk_size=40):
+    """Latest observation photo per chemical (label crop first), shrunk for Excel."""
+    thumbs = {}
+    ids = [int(value) for value in chemical_ids if value is not None]
+    for start in range(0, len(ids), chunk_size):
+        chunk = ids[start:start + chunk_size]
+        placeholders = ", ".join("?" for _ in chunk)
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT ON (chemical_id)
+                    chemical_id,
+                    COALESCE(label_image_data, original_image_data) AS image_data
+                FROM inventory_observations
+                WHERE chemical_id IN ({placeholders})
+                  AND (label_image_data IS NOT NULL OR original_image_data IS NOT NULL)
+                ORDER BY chemical_id, id DESC
+                """,
+                chunk,
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            thumb = _icl_export_thumbnail(_image_bytes(row["image_data"]))
+            if thumb:
+                thumbs[int(row["chemical_id"])] = thumb
+    return thumbs
+
+
+def _icl_build_export_workbook(export_df, sheet_name, thumbs=None):
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter
+
+    data_df = export_df.drop(columns=["_id"], errors="ignore").copy()
+    data_df.insert(0, "No.", range(1, len(data_df) + 1))
+    if thumbs is not None:
+        data_df.insert(1, "Photo", "")
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        data_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        worksheet = writer.book[sheet_name[:31]]
+        worksheet.freeze_panes = "C2" if thumbs is not None else "B2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+
+        header_fill = PatternFill(fill_type="solid", fgColor="25324B")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells[:300]:
+                value = "" if cell.value is None else str(cell.value)
+                max_length = max(max_length, len(value))
+
+            worksheet.column_dimensions[column_letter].width = min(
+                max(max_length + 2, 6), 35
+            )
+
+        if thumbs is not None:
+            photo_letter = get_column_letter(2)
+            # Column width is in characters (~7px each); row height is in points (0.75pt per px).
+            worksheet.column_dimensions[photo_letter].width = EXPORT_THUMB_DISPLAY_PX / 7 + 2
+            ids = list(export_df["_id"]) if "_id" in export_df.columns else []
+            for offset, chemical_id in enumerate(ids):
+                excel_row = offset + 2
+                for cell in worksheet[excel_row]:
+                    cell.alignment = Alignment(vertical="center")
+                thumb = thumbs.get(int(chemical_id)) if chemical_id is not None else None
+                if not thumb:
+                    worksheet.cell(row=excel_row, column=2, value="No photo")
+                    continue
+                picture = XLImage(BytesIO(thumb))
+                scale = EXPORT_THUMB_DISPLAY_PX / max(picture.width, picture.height)
+                picture.width = int(picture.width * scale)
+                picture.height = int(picture.height * scale)
+                worksheet.row_dimensions[excel_row].height = picture.height * 0.75 + 6
+                worksheet.add_image(picture, f"{photo_letter}{excel_row}")
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def compress_observation_image(raw_bytes, max_size=(1600, 1600), quality=82):
     if not raw_bytes:
         return None
@@ -7402,6 +7515,22 @@ elif menu == "Excel Export":
         ["Active Inventory", "All Chemicals", "Disposed Chemicals"],
     )
 
+    conn = get_connection()
+    export_storage_rows = conn.execute(
+        "SELECT id, storage_name FROM storage_units ORDER BY storage_name"
+    ).fetchall()
+    conn.close()
+    export_storage_names = {
+        row["storage_name"]: int(row["id"]) for row in export_storage_rows
+    }
+
+    selected_export_storages = st.multiselect(
+        "Storage",
+        list(export_storage_names),
+        placeholder="All storages",
+        help="Leave empty to export every storage. Pick one or more to export only those.",
+    )
+
     include_details = st.checkbox(
         "Include detailed chemical information",
         value=True,
@@ -7488,7 +7617,33 @@ elif menu == "Excel Export":
             c.disposal_location AS "Disposal Location"
     """
 
-    select_sql = detailed_columns if include_details else basic_columns
+    include_thumbnails = st.checkbox(
+        "Include label photo thumbnails (about 25KB each)",
+        value=False,
+        help="Adds a Photo column with the latest scanned label image for each bottle.",
+    )
+
+    select_sql = (detailed_columns if include_details else basic_columns).replace(
+        "SELECT\n", "SELECT\n            c.id AS \"_id\",\n", 1
+    )
+
+    export_params = []
+    if selected_export_storages:
+        storage_ids = [export_storage_names[name] for name in selected_export_storages]
+        storage_clause = "c.storage_unit_id IN (" + ", ".join("?" for _ in storage_ids) + ")"
+        export_params.extend(storage_ids)
+        status_clause = (
+            f"{status_clause} AND {storage_clause}" if status_clause
+            else f"WHERE {storage_clause}"
+        )
+        storage_label = "_".join(
+            re.sub(r"[^0-9A-Za-z가-힣]+", "-", name).strip("-") for name in selected_export_storages
+        )[:60]
+        file_label = f"{file_label}_{storage_label}"
+        sheet_name = (
+            selected_export_storages[0] if len(selected_export_storages) == 1 else sheet_name
+        )
+        sheet_name = re.sub(r"[\[\]:*?/\\]", "-", sheet_name) or "Export"
 
     conn = get_connection()
     export_rows = conn.execute(
@@ -7498,7 +7653,8 @@ elif menu == "Excel Export":
         LEFT JOIN storage_units su ON c.storage_unit_id = su.id
         {status_clause}
         ORDER BY c.chemical_name, c.id
-        """
+        """,
+        export_params,
     ).fetchall()
     conn.close()
 
@@ -7509,14 +7665,18 @@ elif menu == "Excel Export":
 
     summary_col1, summary_col2 = st.columns(2)
     summary_col1.metric("Chemicals to Export", f"{len(export_df):,}")
-    summary_col2.metric("Columns", len(export_df.columns))
+    summary_col2.metric("Columns", len(export_df.columns) - (1 if "_id" in export_df.columns else 0))
 
     st.subheader("Preview")
 
     if export_df.empty:
         st.info("No chemicals are available for the selected export scope.")
     else:
-        st.dataframe(export_df.head(100), width="stretch", hide_index=True)
+        st.dataframe(
+            export_df.drop(columns=["_id"], errors="ignore").head(100),
+            width="stretch",
+            hide_index=True,
+        )
 
         if len(export_df) > 100:
             st.caption(
@@ -7524,41 +7684,39 @@ elif menu == "Excel Export":
                 "The Excel file will include all rows."
             )
 
-        output = BytesIO()
-
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            export_df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-            worksheet = writer.book[sheet_name[:31]]
-            worksheet.freeze_panes = "A2"
-            worksheet.auto_filter.ref = worksheet.dimensions
-
-            header_fill = PatternFill(fill_type="solid", fgColor="25324B")
-            header_font = Font(bold=True, color="FFFFFF")
-
-            for cell in worksheet[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-            for column_cells in worksheet.columns:
-                max_length = 0
-                column_letter = column_cells[0].column_letter
-
-                for cell in column_cells[:300]:
-                    value = "" if cell.value is None else str(cell.value)
-                    max_length = max(max_length, len(value))
-
-                worksheet.column_dimensions[column_letter].width = min(
-                    max(max_length + 2, 10), 35
-                )
-
-        output.seek(0)
         export_date = datetime.now().strftime("%Y-%m-%d")
         filename = f"ICL_{file_label}_{export_date}.xlsx"
 
+        if include_thumbnails:
+            # Photos are heavy to load, so build them only on request and keep the result
+            # for this exact selection until something changes.
+            export_key = (
+                scope, include_details, tuple(selected_export_storages),
+                tuple(int(value) for value in export_df["_id"]),
+            )
+            prepared = st.session_state.get("icl_export_prepared")
+            if not prepared or prepared[0] != export_key:
+                prepared = None
+                if st.button("🖼️ Prepare Excel with photos", width="stretch"):
+                    with st.spinner(f"Shrinking photos for {len(export_df):,} bottles..."):
+                        thumbs = _icl_export_thumbnails(export_df["_id"])
+                        workbook = _icl_build_export_workbook(export_df, sheet_name, thumbs)
+                    prepared = (export_key, workbook, len(thumbs))
+                    st.session_state["icl_export_prepared"] = prepared
+            if not prepared:
+                st.caption("Click Prepare first. Large storages take a little while.")
+                st.stop()
+            workbook_bytes = prepared[1]
+            st.caption(
+                f"{prepared[2]:,} of {len(export_df):,} bottles have a photo · "
+                f"file size {len(workbook_bytes) / 1024 / 1024:.1f} MB"
+            )
+        else:
+            workbook_bytes = _icl_build_export_workbook(export_df, sheet_name)
+
         st.download_button(
             "📥 Download Excel File",
-            data=output.getvalue(),
+            data=workbook_bytes,
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
