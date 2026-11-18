@@ -3730,8 +3730,10 @@ def _icl_review_product(result, scope):
             # the physical Bottle ID is confirmed, so the comparison is pre-ticked.
             from_inventory = (scope.startswith('scan_') and candidate.get('source') == 'inventory_unreviewed'
                               and not candidate.get('catalog_correction'))
+            # A manufacturer-verified product (name, CAS and catalog all matched) starts ticked.
             acknowledged = st.checkbox('I compared this candidate with the name, CAS and catalog number on the label.',
-                value=from_inventory, key=key + '_confirm_' + str(candidate.get('candidate_id')))
+                value=from_inventory or bool(candidate.get('product_verified') and not candidate.get('catalog_correction')),
+                key=key + '_confirm_' + str(candidate.get('candidate_id')))
             st.session_state[guard.review_key(result, candidate)] = bool(acknowledged)
     with st.expander('OCR text and lookup evidence'):
         observations = result.get('observations') or []
@@ -3837,7 +3839,7 @@ def _icl_clear_add_identity():
     st.session_state['add_unit'] = 'g'
     st.session_state['add_status'] = 'Unopened'
     st.session_state['add_manufacturer_widget_needs_sync'] = True
-    for key in ('icl_v8_registration_draft', 'icl_applied_result_key', 'icl_applied_photos', 'add_source_scan_id'):
+    for key in ('icl_v8_registration_draft', 'icl_applied_result_key', 'icl_applied_photos', 'add_source_scan_id', 'icl_auto_applied'):
         st.session_state.pop(key, None)
 
 
@@ -4276,6 +4278,198 @@ def _icl_ocr_fragments(result):
 
 def _icl_join_pieces(pieces):
     return ' '.join(clean_text(p).strip(' ,;:') for p in pieces if clean_text(p).strip(' ,;:'))
+
+
+# ------------------------------------------------------------
+# Name lookup: when the OCR finds no usable candidate, the user picks the
+# chemical by name and CAS / formula / MW are filled from inventory or PubChem.
+# ------------------------------------------------------------
+_ICL_CAS_RE = re.compile(r'^\s*(\d{2,7})-(\d{2})-(\d)\s*$')
+
+
+def _icl_valid_cas(value):
+    m = _ICL_CAS_RE.match(str(value or ''))
+    if not m:
+        return False
+    digits = m[1] + m[2]
+    return sum(int(c) * i for i, c in enumerate(reversed(digits), 1)) % 10 == int(m[3])
+
+
+def _icl_pubchem_get(path, timeout=6):
+    """PubChem JSON GET. A 404 means "no match" ({}); any other failure raises so it is not cached."""
+    request = Request(PUBCHEM_BASE + path, headers={'User-Agent': PUBCHEM_USER_AGENT, 'Accept': 'application/json'})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        if exc.code in (400, 404):
+            return {}
+        raise
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _icl_pubchem_name_lookup(query):
+    """Name or CAS -> up to 6 PubChem compounds with CAS, formula and MW."""
+    query = clean_text(query)
+    if len(query) < 2:
+        return []
+    is_cas = _icl_valid_cas(query)
+    terms = [query]
+    if not is_cas:
+        data = _icl_pubchem_get('/rest/autocomplete/compound/' + quote(query, safe='') + '/json?limit=6')
+        terms += [t for t in ((data.get('dictionary_terms') or {}).get('compound') or []) if isinstance(t, str)]
+    cids, matched = [], {}
+    for term in list(dict.fromkeys(clean_text(t) for t in terms if clean_text(t)))[:7]:
+        data = _icl_pubchem_get('/rest/pug/compound/name/' + quote(term, safe='') + '/cids/JSON')
+        for cid in ((data.get('IdentifierList') or {}).get('CID') or [])[:2]:
+            if cid and cid not in cids:
+                cids.append(cid)
+                matched[cid] = term
+        if len(cids) >= 6:
+            break
+    cids = cids[:6]
+    if not cids:
+        return []
+    ids = ','.join(str(c) for c in cids)
+    props = _icl_pubchem_get('/rest/pug/compound/cid/' + ids + '/property/Title,MolecularFormula,MolecularWeight/JSON', timeout=8)
+    synonyms = _icl_pubchem_get('/rest/pug/compound/cid/' + ids + '/synonyms/JSON', timeout=8)
+    by_cid = {p.get('CID'): p for p in (props.get('PropertyTable') or {}).get('Properties') or []}
+    cas_by_cid = {}
+    for info in (synonyms.get('InformationList') or {}).get('Information') or []:
+        cas_by_cid[info.get('CID')] = list(dict.fromkeys(s.strip() for s in info.get('Synonym') or [] if _icl_valid_cas(s)))
+    results = []
+    for cid in cids:
+        p = by_cid.get(cid) or {}
+        cas_list = cas_by_cid.get(cid) or []
+        cas = query if is_cas and query in cas_list else (cas_list[0] if cas_list else '')
+        results.append({'name': clean_text(p.get('Title')) or matched[cid], 'cas': cas,
+                        'other_cas': [c for c in cas_list if c != cas][:2],
+                        'formula': clean_text(p.get('MolecularFormula')), 'mw': clean_text(p.get('MolecularWeight')),
+                        'manufacturer': '', 'catalog': '', 'source': 'PubChem',
+                        'source_url': PUBCHEM_BASE + '/compound/' + str(cid)})
+    return results
+
+
+def _icl_inventory_identities(query):
+    """Distinct chemicals already in inventory that match the typed name or CAS."""
+    rows = _icl_search_bottles(query.split(), True) if clean_text(query) else []
+    seen, results = set(), []
+    for row in rows:
+        name = clean_text(row.get('chemical_name'))
+        key = (normalize_chemical_name(name), clean_text(row.get('cas_number')),
+               clean_text(row.get('manufacturer')).upper(), clean_text(row.get('catalog_number')).upper())
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        results.append({'name': name, 'cas': clean_text(row.get('cas_number')), 'other_cas': [],
+                        'formula': clean_text(row.get('molecular_formula')), 'mw': clean_text(row.get('molecular_weight')),
+                        'manufacturer': clean_text(row.get('manufacturer')), 'catalog': clean_text(row.get('catalog_number')),
+                        'source': 'Inventory', 'source_url': '', 'bottle_id': clean_text(row.get('bottle_id'))})
+    return results[:8]
+
+
+def _icl_label_package(result):
+    """Single package size printed on the label, as (amount, unit), or None."""
+    units = {'g': 'g', 'mg': 'mg', 'kg': 'kg', 'ml': 'mL', 'l': 'L'}
+    found = set()
+    for item in ((result or {}).get('fields') or {}).get('package') or []:
+        amount, unit = item.get('amount'), str(item.get('unit') or '')
+        if not (isinstance(amount, (int, float)) and unit):
+            m = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*(kg|mg|g|ml|l)\s*', str(item.get('value') or ''), re.I)
+            if not m:
+                continue
+            amount, unit = float(m[1]), m[2]
+        unit = units.get(unit.lower())
+        if unit and amount > 0:
+            found.add((float(amount), unit))
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def _icl_apply_name_pick(picked, result, records, context):
+    """Button callback: fill the registration form from a name-lookup match."""
+    fields = (result or {}).get('fields') or {}
+    vendors = {clean_text(x.get('value')) for x in fields.get('manufacturer') or []} - {''}
+    codes = {clean_text(x.get('value')) for x in fields.get('catalog') or []} - {''}
+    # The physical bottle's label wins; another bottle's inventory record is only a fallback.
+    manufacturer = next(iter(vendors)) if len(vendors) == 1 else picked.get('manufacturer', '')
+    catalog = next(iter(codes)) if len(codes) == 1 else picked.get('catalog', '')
+    identity = {'name': picked.get('name', ''), 'cas': picked.get('cas', ''), 'formula': picked.get('formula', ''),
+                'mw': picked.get('mw', ''), 'manufacturer': manufacturer, 'catalog': catalog}
+    for key, field in (('add_name', 'name'), ('add_cas', 'cas'), ('add_formula', 'formula'), ('add_mw', 'mw'),
+                       ('add_manufacturer', 'manufacturer'), ('add_catalog', 'catalog')):
+        st.session_state[key] = clean_text(identity[field])
+    st.session_state['add_manufacturer_widget_needs_sync'] = True
+    package = _icl_label_package(result)
+    if package:
+        st.session_state['add_initial_amount'], st.session_state['add_unit'] = package
+    if records is not None:
+        st.session_state['icl_applied_result_key'] = context
+        st.session_state['icl_applied_photos'] = list(records)
+        st.session_state['icl_v8_registration_draft'] = {
+            'fields': identity, 'verification_status': 'MANUAL_NAME_LOOKUP', 'human_reviewed': True,
+            'product_fields_source': 'name_lookup_' + picked.get('source', '').lower(),
+            'sources': [picked.get('source_url') or ('inventory ' + picked.get('bottle_id', '')).strip()]}
+
+
+def _icl_name_lookup_panel(scope, result=None, records=None, context=None):
+    """Search inventory and PubChem by name or CAS and fill the form from the chosen match."""
+    st.markdown('##### Find the chemical by name')
+    query_key = scope + '_namelookup_q'
+    pieces = _icl_ocr_fragments(result) if result else []
+    if pieces:
+        def use_pieces():
+            st.session_state[query_key] = _icl_join_pieces(st.session_state.get(scope + '_namelookup_pieces') or [])
+        st.multiselect('Pick the name from the label text (click pieces in order)', pieces,
+            key=scope + '_namelookup_pieces', on_change=use_pieces, placeholder='Pieces are listed in label reading order')
+    query = clean_text(st.text_input('Chemical name or CAS', key=query_key,
+        placeholder='e.g. Potassium hydroxide or 1310-58-3'))
+    if len(query) < 2:
+        st.caption('Type a name (English works best) or a CAS number. Matches come from your inventory and PubChem; '
+                   'choosing one fills the name, CAS, formula and molecular weight below.')
+        return
+    options = []
+    try:
+        options += _icl_inventory_identities(query)
+    except Exception as exc:
+        st.caption('Inventory search failed: ' + _icl_exception_message(exc))
+    try:
+        with st.spinner('Searching PubChem…'):
+            options += _icl_pubchem_name_lookup(query)
+    except Exception as exc:
+        st.caption('PubChem is not reachable right now (' + _icl_exception_message(exc) + '). Inventory matches are still listed.')
+    if not options:
+        st.warning('No match. Check the spelling or try the English name. You can also type the details into the form below.')
+        return
+
+    def describe(i):
+        o = options[i]
+        parts = [o['name'], 'CAS ' + o['cas'] if o['cas'] else 'no CAS']
+        if o.get('formula'):
+            parts.append(o['formula'])
+        if o['source'] == 'Inventory':
+            maker = ' '.join(x for x in (o.get('manufacturer'), o.get('catalog')) if x)
+            parts.append('In inventory' + (' · ' + maker if maker else ''))
+        else:
+            parts.append('PubChem')
+        return ' | '.join(parts)
+
+    choice_key = scope + '_namelookup_pick_' + hashlib.sha256(query.encode()).hexdigest()[:10]
+
+    def picked_now():
+        # Choosing a match fills the form immediately; no separate apply click.
+        index = st.session_state.get(choice_key)
+        if index is not None and 0 <= index < len(options):
+            _icl_apply_name_pick(options[index], result, records, context)
+
+    choice = st.radio('Matches · choosing one fills the form below', list(range(len(options))), index=None,
+        format_func=describe, key=choice_key, on_change=picked_now)
+    if choice is None:
+        return
+    picked = options[choice]
+    if picked.get('other_cas'):
+        st.caption('PubChem also lists ' + ', '.join(picked['other_cas']) + ' for this compound. Check the CAS on the label.')
+    if picked.get('source_url'):
+        st.link_button('Open in PubChem', picked['source_url'])
 
 
 def _icl_scan_register_form(record, storage_options, target, scope, prefill, candidate, on_saved, default_status='Unopened'):
@@ -4740,6 +4934,40 @@ def _icl_scan_review_one(batch, storage_options, target, move):
             saved()
 
 
+def _icl_analyze_parallel(records, workers=4):
+    """OCR several photos at once (results/errors are written onto each record).
+
+    The URL and key are read here, on the script thread, so worker threads never
+    touch Streamlit session state.
+    """
+    url, key = get_ocr_api_url(), get_ocr_api_key()
+    if not url or not key:
+        for r in records:
+            r['error'] = 'OCR is not configured. Ask an administrator to set OCR_API_KEY.'
+        return records
+
+    def one(r):
+        response = requests.post(url + '/ocr', headers={'X-API-Key': key},
+            files={'file': (r['filename'], r['bytes'], r.get('mime') or 'application/octet-stream')},
+            data={'enable_pubchem': 'true', 'extract_only': 'false'}, timeout=90)
+        if response.status_code != 200:
+            raise RuntimeError(f'OCR API {response.status_code}: {response.text[:250]}')
+        return response.json()
+
+    progress = st.progress(0.0, text=f'Analyzing 0 / {len(records)}')
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(one, r): r for r in records}
+        for done, future in enumerate(as_completed(futures), start=1):
+            r = futures[future]
+            try:
+                r['result'] = future.result()
+                r.pop('error', None)
+            except Exception as exc:
+                r['error'] = _icl_exception_message(exc)
+            progress.progress(done / len(records), text=f'Analyzing {done} / {len(records)}')
+    return records
+
+
 def _icl_scan_analyze(items, previous):
     """Analyze photos concurrently; the OCR request helper never touches session state."""
     old = {r['scan_id']: r for r in previous}
@@ -4839,7 +5067,9 @@ def _icl_add_photos():
         if not st.session_state.get('icl_scan_handoff'):
             st.session_state.pop('icl_add_context', None)
     if mode == 'Manual entry':
-        st.caption('Enter the chemical name and CAS exactly as shown on the label.')
+        st.caption('Enter the chemical name and CAS exactly as shown on the label, or search by name to fill them in.')
+        with st.expander('Search by name or CAS', expanded=False):
+            _icl_name_lookup_panel('add_manual')
         return None, [], True
     if st.session_state.get('icl_scan_handoff'):
         result = st.session_state.get('add_ocr_result') or {}
@@ -4877,17 +5107,8 @@ def _icl_add_photos():
         if too_many:
             st.warning('A bottle can have up to 12 photos.')
         if st.button('Analyze photos', type='primary', disabled=not items or too_many or not get_ocr_api_key()):
-            batch = []
-            progress = st.progress(0.0)
-            for i, item in enumerate(items):
-                record = dict(item, group_id=groups[item['scan_id']])
-                try:
-                    with st.spinner(f'{i + 1}/{len(items)} · {item["filename"]} · Analyzing'):
-                        record['result'] = analyze_scan_memory_item(item, enable_pubchem=True)
-                except Exception as exc:
-                    record['error'] = _icl_exception_message(exc)
-                batch.append(record)
-                progress.progress((i + 1) / len(items))
+            batch = [dict(item, group_id=groups[item['scan_id']]) for item in items]
+            _icl_analyze_parallel(batch)
             st.session_state['icl_add_batch'] = batch
             st.session_state.pop('icl_add_group_selected', None)
             st.session_state.pop('icl_saved_notice', None)
@@ -4905,13 +5126,7 @@ def _icl_add_photos():
                 if r.get('error'):
                     st.error(r['filename'] + ': ' + r['error'])
             if st.button('Retry failed photos'):
-                for r in records:
-                    if r.get('error'):
-                        try:
-                            r['result'] = analyze_scan_memory_item(r, enable_pubchem=True)
-                            r.pop('error', None)
-                        except Exception as exc:
-                            r['error'] = _icl_exception_message(exc)
+                _icl_analyze_parallel([r for r in records if r.get('error')])
                 st.rerun()
             return None, [], False
         merged = __import__('icl_ocr_ui_guard').merge_group(globals(), records, group_id)
@@ -4930,19 +5145,34 @@ def _icl_add_photos():
                 for record in records[1:]:
                     st.image(record['bytes'], caption=record['filename'], width=360)
     candidate, ready = _icl_review_product(result, 'add')
-    if st.button('Apply selected product to form', type='primary', disabled=not ready):
+    if not candidate:
+        # No candidate fits (or "None match" was chosen): pick the chemical by name instead.
+        _icl_name_lookup_panel('add_' + context, result, records, context)
+    # Ticking the label comparison (or a pre-ticked verified product) fills the form
+    # right away; no separate Apply click. Each candidate is applied at most once
+    # automatically, so a failed /draft is not retried on every rerun.
+    pick = (context, (candidate or {}).get('candidate_id'))
+    retry = False
+    if ready and st.session_state.get('icl_applied_result_key') == context and st.session_state.get('icl_auto_applied') == pick:
+        pass
+    elif ready and st.session_state.get('icl_auto_applied') == pick:
+        retry = st.button('Apply selected product to form', type='primary')
+    if ready and (st.session_state.get('icl_auto_applied') != pick or retry):
+        st.session_state['icl_auto_applied'] = pick
         load_add_form_from_ocr(result, records[0]['bytes'] if records else None,
             records[0]['filename'] if records else 'bottle.jpg', selected_candidate=candidate, evidence_photos=records)
         st.session_state.pop('_pending_navigation', None)
         st.session_state['icl_applied_result_key'] = context
         st.session_state['icl_applied_photos'] = list(records)
-        st.rerun()
     applied = st.session_state.get('icl_applied_result_key') == context
     if applied:
-        fields = (st.session_state.get('icl_v8_registration_draft') or {}).get('fields') or {}
-        st.success('Applied to form: ' + str(fields.get('name', '')))
+        draft = st.session_state.get('icl_v8_registration_draft') or {}
+        fields = draft.get('fields') or {}
+        via_name = draft.get('verification_status') == 'MANUAL_NAME_LOOKUP'
+        st.success(('Applied from name search: ' if via_name else 'Applied to form: ') + str(fields.get('name', ''))
+                   + (' · CAS ' + str(fields['cas']) if fields.get('cas') else ''))
         if candidate and candidate.get('name') != fields.get('name'):
-            st.warning('You selected a different candidate. Apply it to update the form.')
+            st.warning('You selected a different candidate. Tick the label comparison above to update the form.')
     return result, records, applied
 
 
@@ -6455,7 +6685,8 @@ elif menu == "Add Chemical":
                 format_func=lambda option: option[2], key="add_storage",
             )
         remaining_amount = st.number_input("Remaining amount", min_value=0.0, key="add_remaining_amount")
-        full_bottle = st.checkbox("Unopened bottle · Set remaining amount equal to the amount above", value=False)
+        # Remembered across bottles: a batch of new bottles is usually all unopened.
+        full_bottle = st.checkbox("Unopened bottle · Set remaining amount equal to the amount above", key="add_full_bottle")
         if full_bottle:
             remaining_amount = initial_amount
         with st.expander("More details", expanded=False):
@@ -6471,12 +6702,12 @@ elif menu == "Add Chemical":
                 purity = st.text_input("Purity", key="add_purity")
                 status = st.selectbox("Status", ["Unopened", "In Use", "Disposal Pending"], key="add_status")
             st.date_input("Registration date", value=registration_date, disabled=True, format="YYYY-MM-DD")
-        registration_confirmed = st.checkbox('I checked the name, CAS, amount and storage location. Register this as a new bottle.', value=False)
+        st.caption('Check the name, CAS, amount and storage location, then register.')
         submitted = st.form_submit_button("Register new bottle", type="primary", disabled=not can_register)
 
     if submitted:
-        if not can_register or not registration_confirmed:
-            st.error('Review the registration details and select the confirmation checkbox.')
+        if not can_register:
+            st.error('Review and apply a product first.')
         elif not chemical_name.strip():
             st.error('Enter a chemical name.')
         elif remaining_amount > initial_amount:
