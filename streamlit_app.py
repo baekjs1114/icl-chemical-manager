@@ -2598,6 +2598,7 @@ LABEL_VENDOR_ALIASES = {
     "Junsei": ("JUNSEI",),
     "DAEJUNG": ("DAEJUNG",),
     "SAMCHUN": ("SAMCHUN",),
+    "DUKSAN": ("DUKSAN", "DUK SAN", "덕산"),
 }
 
 
@@ -2613,6 +2614,7 @@ ADD_CHEMICAL_MANUFACTURERS = [
     "Junsei",
     "DAEJUNG",
     "SAMCHUN",
+    "DUKSAN",
     "Aladdin",
 ]
 
@@ -4479,6 +4481,67 @@ def _icl_label_name_for(name, result):
     return best
 
 
+def _icl_label_choices(result, field):
+    """Values for one form field taken from the label: parsed values first, then OCR text pieces."""
+    if not result:
+        return []
+    fields = result.get('fields') or {}
+    pieces = _icl_ocr_fragments(result)
+    if field == 'name':
+        parsed = [clean_text(x.get('value')) for x in fields.get('name') or [] if float(x.get('score') or 0) >= 0.6]
+        parsed.insert(0, clean_text((result.get('metadata') or {}).get('label_name')))
+        # Names split over two or three adjacent pieces ("Molecular" "sieves," "4Å").
+        joined = []
+        for size in (2, 3):
+            for i in range(len(pieces) - size + 1):
+                text = ' '.join(clean_text(x) for x in pieces[i:i + size]).strip(' ,;:')
+                if len(text) <= 60 and re.search(r'[A-Za-z]{3}', text) and not CAS_PATTERN_LOOSE.search(text):
+                    joined.append(text)
+        values = parsed + pieces + joined
+    elif field == 'cas':
+        values = [clean_text(x.get('value')) for x in fields.get('cas') or []] + [_icl_piece_value('cas', p) for p in pieces]
+        values = [v for v in values if _icl_valid_cas(v)]
+    else:
+        extra = ('catalog_rejected',) if field == 'catalog' else ()
+        values = [clean_text(x.get('value')) for k in (field,) + extra for x in fields.get(k) or []]
+        values += [_icl_piece_value(field, p) for p in pieces]
+    return [v for v in dict.fromkeys(values) if v and len(v) <= 80]
+
+
+CAS_PATTERN_LOOSE = re.compile(r'\d{2,7}\s*-\s*\d{2}\s*-\s*\d')
+
+
+def _icl_prefill_from_label(result):
+    """Start an unidentified bottle's form with what the label clearly says (one value per field)."""
+    fields = (result or {}).get('fields') or {}
+
+    def single(key, ok=lambda v: True):
+        values = {clean_text(x.get('value')) for x in fields.get(key) or []} - {''}
+        values = {v for v in values if ok(v)}
+        return next(iter(values)) if len(values) == 1 else ''
+
+    name = clean_text(((result or {}).get('metadata') or {}).get('label_name'))
+    for key, value in (('add_name', name), ('add_cas', single('cas', _icl_valid_cas)),
+                       ('add_catalog', single('catalog')), ('add_lot', single('lot')),
+                       ('add_manufacturer', single('manufacturer'))):
+        if value:
+            st.session_state[key] = value
+    st.session_state['add_manufacturer_widget_needs_sync'] = True
+    package = _icl_label_package(result)
+    if package:
+        st.session_state['add_initial_amount'], st.session_state['add_unit'] = package
+
+
+def _icl_label_combo(label, key, choices):
+    """Form field that offers label values / OCR pieces and also accepts typed text."""
+    current = clean_text(st.session_state.get(key))
+    options = list(dict.fromkeys([current] + list(choices)))
+    st.session_state[key] = current
+    value = st.selectbox(label, options, key=key, accept_new_options=True,
+                         format_func=lambda v: v if v else '— pick from the label or type —')
+    return value or ''
+
+
 def _icl_ocr_field_picker(scope, result):
     """Pick CAS, catalog and lot from what the OCR read; parsed values are listed first."""
     fields = (result or {}).get('fields') or {}
@@ -5250,10 +5313,12 @@ def _icl_add_photos():
 
         def skip_bottle():
             # Leave this bottle in the batch (it can be picked again from the list) and go to the next one.
-            current = st.session_state.get('icl_add_group_selected', group_ids[0])
+            # Use the bottle shown on this run; the widget state can be empty inside a callback.
+            current = group_id if group_id in group_ids else group_ids[0]
             skipped.add(current)
             ids = sorted(group_ids)
-            later = [g for g in ids if g > current and g not in skipped] or [g for g in ids if g not in skipped]
+            after = ids[ids.index(current) + 1:] + ids[:ids.index(current)]
+            later = [g for g in after if g not in skipped]
             st.session_state['icl_add_group_selected'] = later[0] if later else current
 
         left_count = sum(g not in skipped for g in group_ids)
@@ -5277,6 +5342,7 @@ def _icl_add_photos():
     if st.session_state.get('icl_add_context') != context:
         _icl_clear_add_identity()
         st.session_state['icl_add_context'] = context
+        _icl_prefill_from_label(result)
     if records:
         _icl_show_label(records[0], 'add_' + str(records[0].get('scan_id', '')))
         if len(records) > 1:
@@ -5316,7 +5382,6 @@ def _icl_add_photos():
                    + (' · CAS ' + str(fields['cas']) if fields.get('cas') else ''))
         if candidate and candidate.get('name') != fields.get('name'):
             st.warning('You selected a different candidate. Tick the label comparison above to update the form.')
-    _icl_ocr_field_picker('add_' + context, result)
     # Even without an applied product the user can type the details into the form;
     # the photos of this bottle are attached either way.
     st.session_state['icl_current_records'] = list(records)
@@ -6809,10 +6874,16 @@ elif menu == "Add Chemical":
     registration_date = datetime.now(ZoneInfo("Asia/Seoul")).date()
 
     with st.form("add_chemical_form_" + str(st.session_state.get("icl_add_upload_nonce", 0)) + "_" + str(st.session_state.get("icl_add_context", "manual")), clear_on_submit=False, enter_to_submit=False):
-        chemical_name = st.text_input("Chemical name *", key="add_name")
+        # Photo entry: each field offers what the OCR read (pick) and also accepts typing.
+        def field(label, key, name):
+            if add_ocr_result:
+                return _icl_label_combo(label, key, _icl_label_choices(add_ocr_result, name))
+            return st.text_input(label, key=key)
+
+        chemical_name = field("Chemical name *", "add_name", "name")
         left, right = st.columns(2)
         with left:
-            cas_number = st.text_input("CAS No.", key="add_cas")
+            cas_number = field("CAS No.", "add_cas", "cas")
             manufacturer_choice = st.selectbox(
                 "Manufacturer",
                 ADD_CHEMICAL_MANUFACTURERS + [OTHER_MANUFACTURER_OPTION],
@@ -6823,7 +6894,7 @@ elif menu == "Add Chemical":
                 manufacturer = st.text_input("Manufacturer (manual)", key="add_manufacturer_manual")
             else:
                 manufacturer = manufacturer_choice
-            catalog_number = st.text_input("Catalog No.", key="add_catalog")
+            catalog_number = field("Catalog No.", "add_catalog", "catalog")
         with right:
             ac, uc = st.columns([2, 1])
             with ac:
@@ -6843,7 +6914,7 @@ elif menu == "Add Chemical":
             description = st.text_input("Description / grade", key="add_description")
             dl, dr = st.columns(2)
             with dl:
-                lot_number = st.text_input("Lot No.", key="add_lot")
+                lot_number = field("Lot No.", "add_lot", "lot")
                 owner = st.text_input("Owner / person in charge", key="add_owner")
                 expiration_date = st.text_input("Expiration date", placeholder="YYYY-MM-DD", key="add_expiration")
             with dr:
