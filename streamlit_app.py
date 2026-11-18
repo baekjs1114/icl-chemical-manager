@@ -5234,15 +5234,31 @@ def _icl_add_photos():
             _icl_analyze_parallel(batch)
             st.session_state['icl_add_batch'] = batch
             st.session_state.pop('icl_add_group_selected', None)
+            st.session_state.pop('icl_add_skipped', None)
             st.session_state.pop('icl_saved_notice', None)
             st.rerun()
         batch = st.session_state.get('icl_add_batch') or []
         if not batch:
             st.caption('To register without a photo, select Manual entry above.')
             return None, [], False
-        group_ids = sorted(set(r['group_id'] for r in batch))
+        skipped = st.session_state.setdefault('icl_add_skipped', set())
+        # Skipped bottles go to the end, so after a registration the next bottle is never a skipped one.
+        group_ids = sorted(set(r['group_id'] for r in batch), key=lambda g: (g in skipped, g))
         group_id = st.selectbox('Bottle to review', group_ids, key='icl_add_group_selected',
-            format_func=lambda g: f'Bottle {g} · {sum(r["group_id"] == g for r in batch)} photos')
+            format_func=lambda g: f'Bottle {g} · {sum(r["group_id"] == g for r in batch)} photos'
+                                  + (' · skipped' if g in skipped else ''))
+
+        def skip_bottle():
+            # Leave this bottle in the batch (it can be picked again from the list) and go to the next one.
+            current = st.session_state.get('icl_add_group_selected', group_ids[0])
+            skipped.add(current)
+            ids = sorted(group_ids)
+            later = [g for g in ids if g > current and g not in skipped] or [g for g in ids if g not in skipped]
+            st.session_state['icl_add_group_selected'] = later[0] if later else current
+
+        left_count = sum(g not in skipped for g in group_ids)
+        st.button(f'Skip this bottle → next ({left_count} not skipped)', on_click=skip_bottle,
+                  disabled=len(group_ids) < 2, key='icl_add_skip')
         records = [r for r in batch if r['group_id'] == group_id]
         if any(r.get('error') for r in records):
             for r in records:
