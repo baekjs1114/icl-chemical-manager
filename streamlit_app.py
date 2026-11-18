@@ -4431,6 +4431,54 @@ def _icl_piece_value(field, piece):
     return _ICL_FIELD_PREFIX.sub('', text).strip(' ,;:') or text
 
 
+_ICL_FORM_TERM = (r'(?:\d+(?:\.\d+)?\s*[-~–]\s*)?\d+(?:\.\d+)?\s*mesh|(?:an)?hydrous|(?:mono|di|tri|tetra|penta|hexa|hepta|octa|nona)?hydrate'
+                  r'|pellets?|flakes?|granul(?:e|es|ar)|powder(?:ed)?|crystal(?:s|line)?|beads?|chips?|shot|wire|foil|ingots?'
+                  r'|lumps?|pieces?|turnings?|sponge|fused|precipitated|extra\s+pure|for\s+synthesis|reagent\s+grade|ACS(?:\s+reagent)?'
+                  r'|GR|EP|anhydrous|solution|\d+(?:\.\d+)?\s*(?:%|M|N)\s+(?:in\s+\w+|solution)')
+_ICL_FORM_WORDS = re.compile(r'\s*(?:' + _ICL_FORM_TERM + r')(?:\s*[,/&]\s*(?:' + _ICL_FORM_TERM + r'))*\s*[,;.]?\s*', re.I)
+
+
+def _icl_label_name_for(name, result):
+    """The label's own wording of an applied name, e.g. "Potassium hydroxide, pellet" for "potassium hydroxide".
+
+    Looks for the name inside the name lines the OCR read. If the line starts with
+    the name, the whole line is used; if the start was cut off, the applied name
+    plus the label's extra wording is used. Returns '' when the label adds nothing.
+    """
+    words = re.findall(r'[A-Za-z0-9]+', str(name or ''))
+    if not words:
+        return ''
+    # A photo often cuts off the first letters of the name line ("otassium hydroxide").
+    first = '(?:' + '|'.join(re.escape(words[0][i:]) for i in range(0, len(words[0]) // 3 + 1)) + ')'
+    pattern = re.compile(r'[^A-Za-z0-9]*'.join([first] + [re.escape(w) for w in words[1:]]), re.I)
+    fields = (result or {}).get('fields') or {}
+    lines = [clean_text(x.get('value')) for x in fields.get('name') or [] if float(x.get('score') or 0) >= 0.6]
+    lines.append(clean_text(((result or {}).get('metadata') or {}).get('label_name')))
+    best = ''
+    for line in lines:
+        m = pattern.search(line or '')
+        if not m:
+            continue
+        tail = line[m.end():].rstrip(' ,;:')
+        if not re.search(r'[A-Za-z]{2}|\d', tail) or len(tail) > 40 \
+                or re.match(r'\s*\d+(?:\.\d+)?\s*(?:kg|mg|g|ml|l)\b', tail, re.I):
+            continue
+        whole = m.group().casefold().startswith(words[0].casefold()) and not re.search(r'[A-Za-z0-9]', line[:m.start()])
+        label = line.strip(' ,;:') if whole else clean_text(name) + tail
+        if len(label) > len(best):
+            best = label
+    # A form/grade printed as its own piece of text ("granular", "230-400 mesh",
+    # "anhydrous, granule") is appended when the name line did not include it.
+    base = best or clean_text(name)
+    extras = []
+    for piece in _icl_ocr_fragments(result):
+        if _ICL_FORM_WORDS.fullmatch(piece) and piece.casefold() not in base.casefold():
+            extras.append(piece.strip(' ,;:'))
+    if extras:
+        best = base + ', ' + ', '.join(dict.fromkeys(extras[:2]))
+    return best
+
+
 def _icl_ocr_field_picker(scope, result):
     """Pick CAS, catalog and lot from what the OCR read; parsed values are listed first."""
     fields = (result or {}).get('fields') or {}
@@ -4449,8 +4497,17 @@ def _icl_ocr_field_picker(scope, result):
                 st.session_state['add_' + field] = _icl_piece_value(field, piece)
         return apply
 
-    with st.expander('Fill CAS, catalog or lot from the label text', expanded=False):
-        st.caption('Read values come first, then every piece of text on the label. Choosing one fills that field below.')
+    with st.expander('Fill name, CAS, catalog or lot from the label text', expanded=False):
+        st.caption('Read values come first, then every piece of text on the label. Choosing fills that field below.')
+        name_key = scope + '_pick_name'
+
+        def use_name():
+            joined = _icl_join_pieces(st.session_state.get(name_key) or [])
+            if joined:
+                st.session_state['add_name'] = joined
+        st.multiselect('Name pieces, in order (e.g. Potassium hydroxide → pellet)', list(dict.fromkeys(
+            [clean_text(x.get('value')) for x in fields.get('name') or [] if clean_text(x.get('value'))] + pieces)),
+            key=name_key, on_change=use_name, placeholder='—')
         c1, c2, c3 = st.columns(3)
         for col, field, label, extra in ((c1, 'cas', 'CAS', ()), (c2, 'catalog', 'Catalog No.', ('catalog_rejected',)),
                                          (c3, 'lot', 'Lot No.', ())):
@@ -4464,13 +4521,25 @@ def _icl_name_lookup_panel(scope, result=None, records=None, context=None):
     st.markdown('##### Find the chemical by name')
     query_key = scope + '_namelookup_q'
     pieces = _icl_ocr_fragments(result) if result else []
+    def copy_to_form():
+        # What is picked or typed here is also the chemical name in the form below
+        # (a CAS number goes to the CAS field instead), even when nothing matches.
+        text = clean_text(st.session_state.get(query_key))
+        if not text:
+            return
+        if _icl_valid_cas(text):
+            st.session_state['add_cas'] = text
+        else:
+            st.session_state['add_name'] = text
+
     if pieces:
         def use_pieces():
             st.session_state[query_key] = _icl_join_pieces(st.session_state.get(scope + '_namelookup_pieces') or [])
+            copy_to_form()
         st.multiselect('Pick the name from the label text (click pieces in order)', pieces,
             key=scope + '_namelookup_pieces', on_change=use_pieces, placeholder='Pieces are listed in label reading order')
-    query = clean_text(st.text_input('Chemical name or CAS', key=query_key,
-        placeholder='e.g. Potassium hydroxide or 1310-58-3'))
+    query = clean_text(st.text_input('Chemical name or CAS · also fills the form below', key=query_key,
+        placeholder='e.g. Potassium hydroxide or 1310-58-3', on_change=copy_to_form))
     if len(query) < 2:
         st.caption('Pick the name from the label or type it (English works best), or type a CAS number. '
                    'Matches come from your inventory and PubChem; choosing one fills CAS, formula and molecular weight.')
@@ -5218,6 +5287,10 @@ def _icl_add_photos():
         st.session_state.pop('_pending_navigation', None)
         st.session_state['icl_applied_result_key'] = context
         st.session_state['icl_applied_photos'] = list(records)
+        # The label's wording wins (", pellet", ", anhydrous", "1000" ...); the lookup only confirms identity.
+        label_name = _icl_label_name_for(st.session_state.get('add_name'), result)
+        if label_name:
+            st.session_state['add_name'] = label_name
     applied = st.session_state.get('icl_applied_result_key') == context
     if applied:
         draft = st.session_state.get('icl_v8_registration_draft') or {}
