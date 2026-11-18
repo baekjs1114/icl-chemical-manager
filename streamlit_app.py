@@ -4385,15 +4385,21 @@ def _icl_label_package(result):
     return next(iter(found)) if len(found) == 1 else None
 
 
-def _icl_apply_name_pick(picked, result, records, context):
-    """Button callback: fill the registration form from a name-lookup match."""
+def _icl_apply_name_pick(picked, result, records, context, label_name=''):
+    """Fill the registration form from a name-lookup match.
+
+    The name the user picked from the label (or typed) is kept as the chemical
+    name; the match only supplies CAS, formula and MW. A typed CAS is not a name.
+    """
     fields = (result or {}).get('fields') or {}
     vendors = {clean_text(x.get('value')) for x in fields.get('manufacturer') or []} - {''}
     codes = {clean_text(x.get('value')) for x in fields.get('catalog') or []} - {''}
     # The physical bottle's label wins; another bottle's inventory record is only a fallback.
     manufacturer = next(iter(vendors)) if len(vendors) == 1 else picked.get('manufacturer', '')
     catalog = next(iter(codes)) if len(codes) == 1 else picked.get('catalog', '')
-    identity = {'name': picked.get('name', ''), 'cas': picked.get('cas', ''), 'formula': picked.get('formula', ''),
+    label_name = clean_text(label_name)
+    name = label_name if label_name and not _icl_valid_cas(label_name) else picked.get('name', '')
+    identity = {'name': name, 'cas': picked.get('cas', ''), 'formula': picked.get('formula', ''),
                 'mw': picked.get('mw', ''), 'manufacturer': manufacturer, 'catalog': catalog}
     for key, field in (('add_name', 'name'), ('add_cas', 'cas'), ('add_formula', 'formula'), ('add_mw', 'mw'),
                        ('add_manufacturer', 'manufacturer'), ('add_catalog', 'catalog')):
@@ -4411,6 +4417,48 @@ def _icl_apply_name_pick(picked, result, records, context):
             'sources': [picked.get('source_url') or ('inventory ' + picked.get('bottle_id', '')).strip()]}
 
 
+_ICL_FIELD_PREFIX = re.compile(r'^\s*(?:cat(?:alog(?:ue)?)?\.?\s*(?:no|nr|number|#)?\.?|prod(?:uct)?\.?\s*(?:no|#)?\.?'
+                               r'|lot(?:\s*(?:no|number))?\.?|batch(?:\s*no)?\.?|cas(?:\s*(?:no|rn|#))?\.?)\s*[:#.]?\s*', re.I)
+
+
+def _icl_piece_value(field, piece):
+    """Value of one OCR piece for a form field: the CAS inside it, or the text without a 'Cat. No.'/'Lot' prefix."""
+    text = clean_text(piece)
+    if field == 'cas':
+        m = re.search(r'(?<!\d)(\d{2,7})\s*[-‐‑–]\s*(\d{2})\s*[-‐‑–]\s*(\d)(?!\d)', text)
+        if m:
+            return '-'.join(m.groups())
+    return _ICL_FIELD_PREFIX.sub('', text).strip(' ,;:') or text
+
+
+def _icl_ocr_field_picker(scope, result):
+    """Pick CAS, catalog and lot from what the OCR read; parsed values are listed first."""
+    fields = (result or {}).get('fields') or {}
+    pieces = _icl_ocr_fragments(result)
+    if not pieces and not any(fields.get(k) for k in ('cas', 'catalog', 'lot')):
+        return
+
+    def options(field, extra=()):
+        parsed = [clean_text(x.get('value')) for k in (field,) + tuple(extra) for x in fields.get(k) or []]
+        return list(dict.fromkeys([v for v in parsed if v] + pieces))
+
+    def setter(field, widget):
+        def apply():
+            piece = st.session_state.get(widget)
+            if piece:
+                st.session_state['add_' + field] = _icl_piece_value(field, piece)
+        return apply
+
+    with st.expander('Fill CAS, catalog or lot from the label text', expanded=False):
+        st.caption('Read values come first, then every piece of text on the label. Choosing one fills that field below.')
+        c1, c2, c3 = st.columns(3)
+        for col, field, label, extra in ((c1, 'cas', 'CAS', ()), (c2, 'catalog', 'Catalog No.', ('catalog_rejected',)),
+                                         (c3, 'lot', 'Lot No.', ())):
+            widget = scope + '_pick_' + field
+            col.selectbox(label, options(field, extra), index=None, placeholder='—', key=widget,
+                          on_change=setter(field, widget))
+
+
 def _icl_name_lookup_panel(scope, result=None, records=None, context=None):
     """Search inventory and PubChem by name or CAS and fill the form from the chosen match."""
     st.markdown('##### Find the chemical by name')
@@ -4424,12 +4472,16 @@ def _icl_name_lookup_panel(scope, result=None, records=None, context=None):
     query = clean_text(st.text_input('Chemical name or CAS', key=query_key,
         placeholder='e.g. Potassium hydroxide or 1310-58-3'))
     if len(query) < 2:
-        st.caption('Type a name (English works best) or a CAS number. Matches come from your inventory and PubChem; '
-                   'choosing one fills the name, CAS, formula and molecular weight below.')
+        st.caption('Pick the name from the label or type it (English works best), or type a CAS number. '
+                   'Matches come from your inventory and PubChem; choosing one fills CAS, formula and molecular weight.')
         return
     options = []
     try:
-        options += _icl_inventory_identities(query)
+        # Each widget click reruns the page; search the database once per query.
+        cache = st.session_state.setdefault('icl_namelookup_inventory_cache', {})
+        if query not in cache:
+            cache[query] = _icl_inventory_identities(query)
+        options += cache[query]
     except Exception as exc:
         st.caption('Inventory search failed: ' + _icl_exception_message(exc))
     try:
@@ -4459,8 +4511,10 @@ def _icl_name_lookup_panel(scope, result=None, records=None, context=None):
         # Choosing a match fills the form immediately; no separate apply click.
         index = st.session_state.get(choice_key)
         if index is not None and 0 <= index < len(options):
-            _icl_apply_name_pick(options[index], result, records, context)
+            _icl_apply_name_pick(options[index], result, records, context, query)
 
+    if not _icl_valid_cas(query):
+        st.caption('The name stays "' + query + '" as read from the label; the match fills CAS, formula and MW.')
     choice = st.radio('Matches · choosing one fills the form below', list(range(len(options))), index=None,
         format_func=describe, key=choice_key, on_change=picked_now)
     if choice is None:
@@ -5173,7 +5227,11 @@ def _icl_add_photos():
                    + (' · CAS ' + str(fields['cas']) if fields.get('cas') else ''))
         if candidate and candidate.get('name') != fields.get('name'):
             st.warning('You selected a different candidate. Tick the label comparison above to update the form.')
-    return result, records, applied
+    _icl_ocr_field_picker('add_' + context, result)
+    # Even without an applied product the user can type the details into the form;
+    # the photos of this bottle are attached either way.
+    st.session_state['icl_current_records'] = list(records)
+    return result, records, bool(records) or applied
 
 
 def _icl_register_new_bottle(values, storage, photos, draft, source_scan_id):
@@ -6624,8 +6682,11 @@ elif menu == "Add Chemical":
     add_ocr_result, active_photos, can_register = _icl_add_photos()
     st.divider()
     st.subheader('Bottle details')
+    product_applied = bool(add_ocr_result) and st.session_state.get('icl_applied_result_key') == st.session_state.get('icl_add_context')
     if not can_register:
-        st.info('Review and apply a product, or select Manual entry above.')
+        st.info('Upload and analyze photos, or select Manual entry above.')
+    elif add_ocr_result and not product_applied:
+        st.info('No product applied. Type the name and other details below and register; the photo of this bottle is attached.')
 
     defaults = {
         "add_name": "",
@@ -6707,9 +6768,11 @@ elif menu == "Add Chemical":
 
     if submitted:
         if not can_register:
-            st.error('Review and apply a product first.')
+            st.error('Analyze the photos first, or select Manual entry above.')
         elif not chemical_name.strip():
             st.error('Enter a chemical name.')
+        elif cas_number.strip() and not _icl_valid_cas(cas_number.strip()):
+            st.error('CAS No. "' + cas_number.strip() + '" is not a valid CAS number (format 1234-56-7 with a check digit). Fix it or leave it empty.')
         elif remaining_amount > initial_amount:
             st.error('Remaining amount cannot exceed the initial amount.')
         else:
@@ -6722,8 +6785,18 @@ elif menu == "Add Chemical":
                 expiration_date=expiration_date.strip(), status=status,
                 source_registered_date=registration_date.strftime('%Y-%m-%d'), molecular_formula=molecular_formula.strip(),
                 molecular_weight=molecular_weight.strip(), purity=purity.strip(), created_at=timestamp, updated_at=timestamp)
-            draft = st.session_state.get('icl_v8_registration_draft') if add_ocr_result else None
-            photos = st.session_state.get('icl_applied_photos', []) if add_ocr_result else []
+            if add_ocr_result and product_applied:
+                draft = st.session_state.get('icl_v8_registration_draft')
+                photos = st.session_state.get('icl_applied_photos', [])
+            elif add_ocr_result:
+                # Typed by hand for a bottle the OCR did not identify.
+                draft = {'fields': {'name': values['chemical_name'], 'cas': values['cas_number'],
+                                    'formula': values['molecular_formula'], 'mw': values['molecular_weight'],
+                                    'manufacturer': values['manufacturer'], 'catalog': values['catalog_number']},
+                         'verification_status': 'MANUAL_TYPED', 'human_reviewed': True}
+                photos = st.session_state.get('icl_current_records', [])
+            else:
+                draft, photos = None, []
             source_scan_id = st.session_state.get('add_source_scan_id')
             try:
                 bottle_id = _icl_register_new_bottle(values, storage, photos, draft, source_scan_id)
@@ -6749,6 +6822,7 @@ elif menu == "Add Chemical":
                 except Exception:
                     st.session_state['icl_saved_notice'] += ' · Safety lookup failed. Please check SDS.'
                 st.session_state['icl_reset_after_save'] = True
+                st.session_state.pop('icl_namelookup_inventory_cache', None)
                 st.session_state['icl_add_upload_nonce'] = st.session_state.get('icl_add_upload_nonce', 0) + 1
                 st.rerun()
 
